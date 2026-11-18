@@ -154,6 +154,7 @@ pub fn spawn(k: &mut Kernel, name: &str, file: &[u8]) -> Result<Spawned, LoadErr
         reply_to: None,
         outgoing: Outgoing::default(),
         recv_slot: None,
+        zombie: false,
     };
     let thread = match k.threads.insert(thread) {
         Ok(t) => t,

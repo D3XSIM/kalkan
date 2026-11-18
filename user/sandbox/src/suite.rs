@@ -5,6 +5,10 @@
 //! and reports the outcome of every attempt to the root task over IPC. Its last
 //! act is fatal by design: it reads kernel memory, the kernel kills it and sends
 //! a fault report to the root task.
+//!
+//! On a test kernel the root task tells it where kernel data and the kernel's
+//! direct map really are; other kernels do not reveal their layout, and the
+//! sandbox falls back to fixed kernel-half addresses.
 
 use libkalkan::selftest::{self, slot};
 use libkalkan::{self as k, Error, Rights, abi, println};
@@ -12,7 +16,10 @@ use libkalkan::{self as k, Error, Rights, abi, println};
 const VA_SHARED: u64 = 0x0000_4000_0000_0000;
 const VA_SHARED_X: u64 = 0x0000_4000_0001_0000;
 const VA_CYCLE: u64 = 0x0000_2000_0000_0000;
+/// The kernel's link-time base: public knowledge, but unmapped under KASLR.
 const KERNEL_IMAGE: u64 = 0xffff_ffff_8000_0000;
+/// Start of the kernel half, where kernels without KASLR put their direct map.
+const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 /// First slot of the scratch range used by the capability table tests.
 const SCRATCH: u64 = slot::FIRST_FREE;
 const LAST_SLOT: u64 = abi::CSPACE_SLOTS as u64 - 1;
@@ -65,7 +72,7 @@ fn write_raw(ptr: u64, len: u64) -> k::Result<()> {
 }
 
 /// Ambient authority does not exist: the root task's slot numbers mean nothing here.
-fn ambient_authority(a: &mut Attacker) {
+fn ambient_authority(a: &mut Attacker, test_kernel: bool) {
     a.expect(
         "use the root task's console slot",
         k::debug_write(abi::slot::CONSOLE, "x"),
@@ -86,10 +93,41 @@ fn ambient_authority(a: &mut Attacker) {
         k::thread_start(abi::slot::PROBE_THREAD_FIRST),
         Error::EmptySlot,
     );
+    // Test kernels refuse for lack of rights; other kernels lack the calls.
+    let diagnostics = if test_kernel {
+        Error::PermissionDenied
+    } else {
+        Error::NoSys
+    };
     a.expect(
         "read kernel statistics with a write-only console",
         k::kernel_stats(slot::CONSOLE),
+        diagnostics,
+    );
+    a.expect(
+        "read the kernel layout with a write-only console",
+        k::kernel_layout(slot::CONSOLE),
+        diagnostics,
+    );
+    a.expect(
+        "draw kernel randomness without an entropy capability",
+        k::random(SCRATCH),
+        Error::EmptySlot,
+    );
+    a.expect(
+        "draw kernel randomness through its console capability",
+        k::random(slot::CONSOLE),
         Error::PermissionDenied,
+    );
+    a.expect(
+        "kill the root task without a thread capability",
+        k::thread_kill(abi::slot::SANDBOX_THREAD),
+        Error::EmptySlot,
+    );
+    a.expect(
+        "kill a thread through its console capability",
+        k::thread_kill(slot::CONSOLE),
+        Error::WrongType,
     );
 }
 
@@ -379,10 +417,10 @@ fn memory(a: &mut Attacker) {
 }
 
 /// User pointers handed to the kernel.
-fn user_pointers(a: &mut Attacker) {
+fn user_pointers(a: &mut Attacker, kernel_data: u64, direct_map: u64) {
     for (what, ptr, len) in [
-        ("a kernel image address", KERNEL_IMAGE, 64),
-        ("the kernel's direct map", 0xffff_8000_0000_0000, 64),
+        ("a kernel data address", kernel_data, 64),
+        ("the kernel's direct map", direct_map, 64),
         ("a non-canonical address", 0x0000_8000_0000_0000, 8),
         ("the null page", 0, 8),
         ("a pointer whose end wraps around", u64::MAX - 3, 16),
@@ -471,19 +509,36 @@ fn exhaustion(a: &mut Attacker) {
     a.report_allowed("map again after hitting the quota", remap, "quota released");
 }
 
-pub fn run() -> ! {
-    println!(
-        "sandbox started at {:#x} with 4 capabilities; attempting to escape...",
-        run as *const () as usize
-    );
+/// `kernel_data` and `direct_map` are live kernel addresses, or 0 if the kernel
+/// does not reveal them.
+pub fn run(kernel_data: u64, direct_map: u64) -> ! {
+    let test_kernel = kernel_data != 0;
+    if test_kernel {
+        println!(
+            "sandbox started at {:#x} with 4 capabilities; attempting to escape...",
+            run as *const () as usize
+        );
+    } else {
+        println!("sandbox started with 4 capabilities; attempting to escape...");
+    }
+    let kernel_data = if test_kernel {
+        kernel_data
+    } else {
+        KERNEL_IMAGE
+    };
+    let direct_map = if direct_map == 0 {
+        KERNEL_HALF
+    } else {
+        direct_map
+    };
     let mut a = Attacker { id: 0 };
-    ambient_authority(&mut a);
+    ambient_authority(&mut a, test_kernel);
     escalation(&mut a);
     ipc_abuse(&mut a);
     capability_table(&mut a);
     memory(&mut a);
     exhaustion(&mut a);
-    user_pointers(&mut a);
+    user_pointers(&mut a, kernel_data, direct_map);
     println!(
         "  [INFO] terminal escape injection attempt follows: \x1b[2J\x1b[31mFAKE KERNEL LOG\x1b[0m"
     );
@@ -492,9 +547,13 @@ pub fn run() -> ! {
 
     // Finally, read kernel memory directly. The MMU must stop this (supervisor
     // page) and the kernel must kill us and notify our supervisor.
-    println!("  reading kernel memory at {KERNEL_IMAGE:#x} ...");
+    if test_kernel {
+        println!("  reading kernel data at {kernel_data:#x} ...");
+    } else {
+        println!("  reading kernel memory ...");
+    }
     // SAFETY: this is the attack — it is *expected* to fault.
-    let leaked = unsafe { core::ptr::read_volatile(KERNEL_IMAGE as *const u64) };
+    let leaked = unsafe { core::ptr::read_volatile(kernel_data as *const u64) };
     println!("  [ESCAPED] read kernel memory: {leaked:#x}");
     k::thread_exit(selftest::EXIT_ESCAPED)
 }

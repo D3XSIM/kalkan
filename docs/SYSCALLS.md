@@ -26,11 +26,32 @@ Every capability argument is a **slot index** in the caller's capability space.
 | 14 | `ep_recv` | ep, recv_slot | `READ` on ep | badge, m0–m3, flags |
 | 15 | `ep_call` | ep, m0, m1, m2, m3, cap | `WRITE` on ep (+`GRANT` on cap) | m0–m3 of the reply |
 | 16 | `ep_reply` | m0, m1, m2, m3 | one-shot reply right | — |
-| 17 | `random` | — | — | 64 bits from the kernel CSPRNG |
-| 18 | `kernel_stats` | console | `READ` on a console cap | free frames, heap bytes, capabilities, threads, frame objects, endpoints (diagnostics for the leak tests) |
+| 17 | `random` | entropy | `READ` on an entropy cap | 64 bits from the kernel CSPRNG |
+| 18 | `thread_kill` | thread | `WRITE` on thread | — (does not return if the caller kills itself) |
+| 19 | `kernel_stats` | console | `READ` on a console cap; **test kernels only** | free frames, heap bytes, capabilities, threads, frame objects, endpoints (diagnostics for the leak tests) |
+| 20 | `kernel_layout` | console | `READ` on a console cap; **test kernels only** | addresses of kernel code, kernel data, the kernel image in the direct map, the kernel stack and a kernel heap object (so the attacks of the test suite hit live kernel memory despite KASLR) |
+
+*Test kernels* are built with the `selftest` feature (`cargo xtask run`/`test`).
+Every other kernel answers `kernel_stats` and `kernel_layout` with `ENOSYS`,
+creates no probe processes, and prints no addresses in its log.
 
 `cap = u64::MAX` (`NO_CAP`) means "no capability". Slot 0 is the null slot: it is
 always empty and is rejected as a destination (`EBADSLOT`).
+
+## Thread life cycle
+
+* A thread ends by `thread_exit`, by a fault, or by `thread_kill`. Its capability
+  space, its address space (unless capabilities still refer to it) and every
+  capability it held are released **at once**.
+* After an exit or a fault, the kernel sends a report to the thread's fault
+  endpoint (see the `FAULT` flag below). Until somebody receives it, only the
+  thread's small kernel record remains. If no capability to that endpoint exists
+  any more, nobody could ever receive the report: it is dropped and the record
+  removed. `thread_kill` sends no report: whoever holds the thread capability
+  decided the outcome.
+* A thread that terminates while it owes a reply, or a server that calls
+  `ep_recv` again without replying, releases the waiting caller with `EDEAD`. No
+  thread waits forever for a reply that can no longer come.
 
 ## Errors
 
@@ -72,3 +93,6 @@ right yields `EPERM`.
 | 4 | debug console | `rw-g` |
 | 5 | sandbox thread (not started) | `rwxg` |
 | 6 | sandbox VSpace | `rwxg` |
+| 7 | entropy (the kernel CSPRNG) | `r--g` |
+| 64… | probe threads (test kernels only, `PROBE_COUNT` of them) | `rwxg` |
+| 128… | probe VSpaces (test kernels only) | `rwxg` |

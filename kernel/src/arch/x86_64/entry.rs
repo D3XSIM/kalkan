@@ -21,6 +21,7 @@
 
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::gdt::{USER_CS, USER_DS};
 
@@ -250,6 +251,16 @@ extern "C" fn kalkan_trap_entry(frame: *mut TrapFrame) {
     }
 }
 
+/// Debug traps taken in kernel mode (see [`kernel_trap`]).
+static KERNEL_DEBUG_TRAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of debug traps that leaked into kernel mode and were disarmed. The
+/// test suite expects none: the system call entry clears the trap flag.
+#[must_use]
+pub fn kernel_debug_traps() -> u64 {
+    KERNEL_DEBUG_TRAPS.load(Ordering::Relaxed)
+}
+
 /// A trap taken while executing kernel code.
 ///
 /// The kernel runs with interrupts disabled, so the only possible causes are CPU
@@ -262,6 +273,7 @@ fn kernel_trap(frame: &mut TrapFrame) {
         // leaked in from user space. It runs on its own IST stack, so it is
         // harmless: disarm it and continue.
         1 => {
+            KERNEL_DEBUG_TRAPS.fetch_add(1, Ordering::Relaxed);
             frame.rflags &= !(1 << 8); // TF
             super::cpu::reset_debug_registers();
         }

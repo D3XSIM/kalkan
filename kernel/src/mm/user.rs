@@ -130,6 +130,12 @@ impl AddressSpace {
                 frame::free(t);
                 *tables -= 1;
             });
+            if self.is_active() {
+                // The CPU may already have cached (even speculatively) entries
+                // of the tables just freed. Drop them before the frames can be
+                // handed out again, exactly as `unmap` does.
+                arch::invlpg(vaddr);
+            }
         }
         result
     }
@@ -149,6 +155,12 @@ impl AddressSpace {
             arch::invlpg(vaddr);
         }
         Some(phys)
+    }
+
+    /// Self-audit: visits every present user mapping as `(vaddr, entry)`. Returns
+    /// the number of page tables that exist and the number the quota counts.
+    pub fn census(&self, leaf: &mut dyn FnMut(u64, u64)) -> (u32, u32) {
+        (paging::walk_user(self.pml4, leaf), self.tables)
     }
 
     /// Translates a user address (user-accessible pages only).

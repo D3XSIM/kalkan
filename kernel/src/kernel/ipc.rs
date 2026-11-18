@@ -11,6 +11,8 @@
 //! recorded in the derivation tree (the sender can revoke it later).
 //!
 //! `call` gives the receiver a one-shot reply right that is consumed by `reply`.
+//! A server that receives again without replying gives the right up: the waiting
+//! caller is released with `EDEAD` instead of waiting forever.
 
 use kcore::abi;
 
@@ -22,7 +24,12 @@ impl Kernel {
     pub(super) fn ipc_send(&mut self, sender: ThreadId, ep: EndpointId, msg: Outgoing) {
         let receiver = loop {
             let Some(e) = self.endpoints.get_mut(ep) else {
-                self.complete(sender, Err(abi::Error::Dead));
+                if msg.fault {
+                    // Nobody left to report to.
+                    self.finish_thread(sender);
+                } else {
+                    self.complete(sender, Err(abi::Error::Dead));
+                }
                 return;
             };
             match e.receivers.pop_front() {
@@ -54,8 +61,19 @@ impl Kernel {
 
     /// `receiver` waits for a message on `ep`.
     pub(super) fn ipc_recv(&mut self, receiver: ThreadId, ep: EndpointId, recv_slot: Option<u64>) {
-        if let Some(t) = self.threads.get_mut(receiver) {
+        let abandoned = self.threads.get_mut(receiver).and_then(|t| {
             t.recv_slot = recv_slot;
+            t.reply_to.take()
+        });
+        // Receiving again without replying abandons the pending call: release the
+        // caller instead of leaving it blocked forever.
+        if let Some(caller) = abandoned
+            && self
+                .threads
+                .get(caller)
+                .is_some_and(|c| c.state == ThreadState::BlockedReply)
+        {
+            self.complete(caller, Err(abi::Error::Dead));
         }
         let sender = loop {
             let Some(e) = self.endpoints.get_mut(ep) else {

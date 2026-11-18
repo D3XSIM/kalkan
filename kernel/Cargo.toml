@@ -20,6 +20,10 @@ qemu-exit = []
 # Re-verify the complete kernel object graph after every trap (see
 # `src/kernel/audit.rs`). Enabled by `cargo xtask test`.
 audit = []
+# Test kernel: creates the probe processes of the adversarial test suite, offers
+# the test-only system calls `kernel_stats` and `kernel_layout`, and prints
+# addresses in the log. Enabled by `cargo xtask test`; never in a real build.
+selftest = []
 
 [dependencies]
 kcore = { package = "kalkan-core", path = "../kcore" }

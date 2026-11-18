@@ -61,19 +61,7 @@ impl Kernel {
                 );
                 // A supervised thread reports its exit like a fault, so its
                 // supervisor is never left waiting for it.
-                match self.threads.get(t).and_then(|th| th.fault_ep) {
-                    Some((ep, badge)) if self.endpoints.contains(ep) => {
-                        let msg = Outgoing {
-                            badge,
-                            words: [abi::EXIT_VECTOR, a[0], 0, 0],
-                            cap_slot: None,
-                            call: false,
-                            fault: true,
-                        };
-                        self.ipc_send(t, ep, msg);
-                    }
-                    _ => self.finish_thread(t),
-                }
+                self.report_death(t, [abi::EXIT_VECTOR, a[0], 0, 0]);
                 return None;
             }
             sys::YIELD => {
@@ -114,14 +102,21 @@ impl Kernel {
                 Err(e) => Err(e),
             },
             sys::EP_REPLY => self.ipc_reply(t, [a[0], a[1], a[2], a[3]]),
-            sys::RANDOM => {
-                let v = self.rng.next_u64();
-                if let Some(th) = self.threads.get_mut(t) {
-                    th.ctx.rdi = v;
+            sys::RANDOM => self.sys_random(t, cspace, a[0]),
+            sys::THREAD_KILL => match self.thread_cap(cspace, a[0], Rights::WRITE) {
+                Ok(target) => {
+                    kprintln!("[kernel] thread '{}' killed", self.name(target));
+                    // No report: whoever holds the thread capability decided this.
+                    self.finish_thread(target);
+                    if target == t {
+                        return None; // the caller killed itself
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
+                Err(e) => Err(e),
+            },
             sys::KERNEL_STATS => self.sys_kernel_stats(t, cspace, a[0]),
+            sys::KERNEL_LAYOUT => self.sys_kernel_layout(t, cspace, a[0]),
             _ => Err(Error::NoSys),
         };
         self.finish_syscall(t, result);
@@ -168,9 +163,10 @@ impl Kernel {
         }
     }
 
+    /// Resolves a thread capability to a live (not terminated) thread.
     fn thread_cap(&self, cs: CSpaceId, slot: u64, need: Rights) -> Result<ThreadId, Error> {
         match self.caps.lookup(cs, slot, need)?.object {
-            Object::Thread(t) if self.threads.contains(t) => Ok(t),
+            Object::Thread(t) if self.threads.get(t).is_some_and(|th| !th.zombie) => Ok(t),
             Object::Thread(_) => Err(Error::Dead),
             _ => Err(Error::WrongType),
         }
@@ -205,9 +201,21 @@ impl Kernel {
         Ok(())
     }
 
+    fn sys_random(&mut self, t: ThreadId, cs: CSpaceId, slot: u64) -> SysResult {
+        if self.caps.lookup(cs, slot, Rights::READ)?.object != Object::Entropy {
+            return Err(Error::WrongType);
+        }
+        let v = self.rng.next_u64();
+        self.threads.get_mut(t).ok_or(Error::Dead)?.ctx.rdi = v;
+        Ok(())
+    }
+
+    /// Test kernels only: aggregate resource usage for the leak tests.
     fn sys_kernel_stats(&mut self, t: ThreadId, cs: CSpaceId, slot: u64) -> SysResult {
-        let cap = self.caps.lookup(cs, slot, Rights::READ)?;
-        if cap.object != Object::Console {
+        if !cfg!(feature = "selftest") {
+            return Err(Error::NoSys);
+        }
+        if self.caps.lookup(cs, slot, Rights::READ)?.object != Object::Console {
             return Err(Error::WrongType);
         }
         let (free, _) = mm::frame::stats();
@@ -223,6 +231,24 @@ impl Kernel {
         [
             th.ctx.rdi, th.ctx.rsi, th.ctx.rdx, th.ctx.r10, th.ctx.r8, th.ctx.r9,
         ] = values;
+        Ok(())
+    }
+
+    /// Test kernels only: addresses of live kernel memory, so that the attacks
+    /// of the test suite hit the real kernel despite KASLR.
+    fn sys_kernel_layout(&mut self, t: ThreadId, cs: CSpaceId, slot: u64) -> SysResult {
+        if !cfg!(feature = "selftest") {
+            return Err(Error::NoSys);
+        }
+        if self.caps.lookup(cs, slot, Rights::READ)?.object != Object::Console {
+            return Err(Error::WrongType);
+        }
+        let l = self.landmarks;
+        let heap = self.heap_canary.as_ref().map_or(0, |b| b.as_ptr() as u64);
+        let th = self.threads.get_mut(t).ok_or(Error::Dead)?;
+        [
+            th.ctx.rdi, th.ctx.rsi, th.ctx.rdx, th.ctx.r10, th.ctx.r8, th.ctx.r9,
+        ] = [l.text, l.data, l.direct_map, l.stack, heap, 0];
         Ok(())
     }
 
@@ -454,12 +480,15 @@ impl Kernel {
     ) -> SysResult {
         let target = self.thread_cap(cs, thread_slot, Rights::WRITE)?;
         let (ep, badge) = self.endpoint_cap(cs, ep_slot, Rights::WRITE)?;
-        // The thread holds a reference on its fault endpoint, so the endpoint (and
-        // the id stored here) stays valid for as long as the thread needs it.
-        self.retain(&Object::Endpoint(ep));
         let th = self.threads.get_mut(target).ok_or(Error::Dead)?;
-        if let Some((old, _)) = th.fault_ep.replace((ep, badge)) {
-            self.release(Object::Endpoint(old));
+        let old = th.fault_ep.replace((ep, badge));
+        // The thread keeps its fault endpoint alive (as a handler, not as a
+        // capability), so the id stored here stays valid while the thread needs it.
+        if let Some(e) = self.endpoints.get_mut(ep) {
+            e.handlers += 1;
+        }
+        if let Some((old, _)) = old {
+            self.drop_handler(old);
         }
         Ok(())
     }

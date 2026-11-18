@@ -5,14 +5,20 @@
 //! runs an adversarial self-test suite: every test performs an operation that a
 //! secure kernel **must refuse** (or must perform in a constrained way) and checks
 //! that the kernel did exactly that.
+//!
+//! On a *test kernel* (`selftest` feature) the suite also measures the kernel's
+//! resource counters, attacks kernel memory at its real addresses with one probe
+//! process per attack, and runs the process life-cycle tests. Other kernels offer
+//! none of the facilities these need; the suite detects that and runs everything
+//! else.
 
 #![no_std]
 #![no_main]
 
 use core::fmt::Display;
 
-use libkalkan::selftest::{self, Expect, mode, slot as sb, vector};
-use libkalkan::{self as k, Error, Rights, abi, abi::slot, println};
+use libkalkan::selftest::{self, Expect, Target, mode, pf, slot as sb, vector};
+use libkalkan::{self as k, Error, KernelLayout, KernelStats, Rights, abi, abi::slot, println};
 
 // Slots used by the root task.
 const CONSOLE_W: u64 = slot::FIRST_FREE; // console, WRITE only
@@ -34,6 +40,10 @@ const FUZZ_FRAME: u64 = slot::FIRST_FREE + 15;
 const QUOTA_FIRST: u64 = 24;
 const QUOTA_LAST: u64 = 63;
 // Slots above the probe capabilities.
+// Process life-cycle tests: an endpoint the root task calls a probe on, and one
+// whose only capability is dropped (slots 188..=199 are free).
+const SERVER: u64 = 190;
+const ORPHAN: u64 = 191;
 const PAGE_A: u64 = 200;
 const PAGE_B: u64 = 201;
 const LEAK: u64 = 204;
@@ -51,9 +61,16 @@ const KERNEL_ADDR: u64 = 0xffff_8000_0000_0000;
 struct Suite {
     passed: u32,
     failed: u32,
+    skipped: u32,
 }
 
 impl Suite {
+    /// A test that cannot run on this kernel.
+    fn skip(&mut self, name: &str, why: &str) {
+        self.skipped += 1;
+        println!("  [SKIP] {name} ({why})");
+    }
+
     fn check(&mut self, name: &str, ok: bool, detail: impl Display) {
         if ok {
             self.passed += 1;
@@ -481,6 +498,67 @@ fn copy_tests(s: &mut Suite) {
     );
 }
 
+/// System calls added for the entropy capability, `thread_kill` and the test-only
+/// diagnostics.
+fn kernel_interface_tests(s: &mut Suite, test_kernel: bool) {
+    section("entropy, thread control and diagnostics");
+    let a = s.expect_ok(
+        "randomness through the entropy capability",
+        k::random(slot::ENTROPY),
+    );
+    let b = k::random(slot::ENTROPY).ok();
+    s.check(
+        "two random values differ",
+        a.is_some() && b.is_some() && a != b,
+        "64 bits each from the kernel CSPRNG",
+    );
+    let _ = k::cap_mint(slot::ENTROPY, SCRATCH, Rights::GRANT, 0);
+    s.expect_err(
+        "randomness needs READ on the entropy capability",
+        k::random(SCRATCH),
+        Error::PermissionDenied,
+    );
+    let _ = k::cap_delete(SCRATCH);
+    s.expect_err(
+        "a console capability is no entropy source",
+        k::random(slot::CONSOLE),
+        Error::WrongType,
+    );
+    s.expect_err(
+        "kill through a capability that is not a thread",
+        k::thread_kill(slot::CONSOLE),
+        Error::WrongType,
+    );
+    s.expect_err(
+        "kill through an empty slot",
+        k::thread_kill(SCRATCH),
+        Error::EmptySlot,
+    );
+    if test_kernel {
+        s.expect_err(
+            "the kernel layout needs READ on the console",
+            k::kernel_layout(CONSOLE_W),
+            Error::PermissionDenied,
+        );
+    } else {
+        s.expect_err(
+            "no kernel statistics outside test kernels",
+            k::kernel_stats(slot::CONSOLE),
+            Error::NoSys,
+        );
+        s.expect_err(
+            "no kernel layout outside test kernels",
+            k::kernel_layout(slot::CONSOLE),
+            Error::NoSys,
+        );
+        s.expect_err(
+            "no probe processes outside test kernels",
+            k::thread_start(slot::PROBE_THREAD_FIRST),
+            Error::EmptySlot,
+        );
+    }
+}
+
 /// Kernel memory and object leaks, measured from the kernel's own counters.
 fn leak_tests(s: &mut Suite) {
     section("kernel resource leaks");
@@ -534,11 +612,13 @@ fn leak_tests(s: &mut Suite) {
     );
 }
 
-/// `true` if the kernel uses no more resources in `after` than in `before`.
-fn no_growth(before: Option<k::KernelStats>, after: Option<k::KernelStats>) -> bool {
+/// `true` if the kernel holds exactly the same resources in `after` as in
+/// `before` (the heap may only shrink). An exact frame count also catches frames
+/// that were freed twice or freed while still in use.
+fn no_growth(before: Option<KernelStats>, after: Option<KernelStats>) -> bool {
     match (before, after) {
         (Some(b), Some(a)) => {
-            a.free_frames >= b.free_frames
+            a.free_frames == b.free_frames
                 && a.heap_bytes <= b.heap_bytes
                 && a.capabilities == b.capabilities
                 && a.threads == b.threads
@@ -650,23 +730,23 @@ struct Served {
     passed: u32,
     failed: u32,
     wrong_badge: bool,
-    marks: [Option<k::KernelStats>; 4],
+    marks: [Option<KernelStats>; 4],
+    /// Life-cycle tests: result of the root task's call to the probe.
+    call: Option<k::Result<()>>,
+    /// Life-cycle tests: kernel counters while the probe was alive and right
+    /// after it died, before its report was collected.
+    zombie: (Option<KernelStats>, Option<KernelStats>),
     /// The kernel's final report: `[vector, error, address, rip]` for a fault,
     /// `[EXIT_VECTOR, code, 0, 0]` for an exit.
     end: [u64; 4],
 }
 
 /// Serves one supervised process until the kernel reports that it is gone.
+/// `hello` answers its first message (its role and arguments).
 ///
 /// With `noise` the process is a fuzzer: its messages are answered but their
 /// contents mean nothing.
-fn serve(
-    client_badge: u64,
-    fault_badge: u64,
-    mode: u64,
-    argument: u64,
-    noise: bool,
-) -> Option<Served> {
+fn serve(client_badge: u64, fault_badge: u64, hello: [u64; 4], noise: bool) -> Option<Served> {
     let mut served = Served::default();
     loop {
         let msg = k::recv(ENDPOINT, Some(RECV)).ok()?;
@@ -681,9 +761,19 @@ fn serve(
         if msg.badge != client_badge {
             served.wrong_badge = true;
         }
+        // A transferred capability is never kept.
+        if msg.info & abi::msg::CAP_TRANSFERRED != 0 {
+            let _ = k::cap_delete(RECV);
+        }
         let reply = match msg.words[0] {
-            selftest::HELLO => [mode, argument, 0, 0],
+            selftest::HELLO => {
+                let _ = k::reply(hello);
+                after_hello(hello[0], &mut served);
+                continue;
+            }
             _ if noise => [u64::MAX; 4],
+            // Receiving again without replying abandons the call.
+            selftest::ABANDON => continue,
             selftest::REPORT => {
                 if msg.words[2] == 1 {
                     served.passed += 1;
@@ -702,32 +792,70 @@ fn serve(
             selftest::DONE => [0; 4],
             _ => [u64::MAX; 4],
         };
-        if msg.info & abi::msg::CAP_TRANSFERRED != 0 {
-            let _ = k::cap_delete(RECV);
-        }
         let _ = k::reply(reply);
     }
 }
 
+/// Life-cycle tests act right after a probe has learned its role.
+fn after_hello(mode: u64, served: &mut Served) {
+    match mode {
+        // Call the probe, which receives the call and dies without answering.
+        mode::SERVER_DIES => {
+            served.call = Some(k::call(SERVER, [selftest::HOLD, 0, 0, 0], None).map(|_| ()));
+        }
+        // Let the probe run and exit while nobody receives its report.
+        mode::ZOMBIE => {
+            let alive = k::kernel_stats(slot::CONSOLE).ok();
+            let dead = settle(|now| alive.is_some_and(|a| now.capabilities < a.capabilities));
+            served.zombie = (alive, dead);
+        }
+        _ => {}
+    }
+}
+
+/// Gives the other processes time to run until the kernel's counters satisfy
+/// `done` (or a generous limit passes); returns the last counters.
+fn settle(done: impl Fn(&KernelStats) -> bool) -> Option<KernelStats> {
+    let mut now = None;
+    for _ in 0..1000 {
+        k::yield_now();
+        now = k::kernel_stats(slot::CONSOLE).ok();
+        if now.as_ref().is_some_and(&done) {
+            break;
+        }
+    }
+    now
+}
+
 /// Runs the main sandbox and checks everything it reported.
-fn run_sandbox(s: &mut Suite) {
+fn run_sandbox(s: &mut Suite, layout: Option<KernelLayout>) {
+    // On a test kernel the sandbox attacks live kernel memory.
+    let (data, direct_map) = layout.map_or((0, 0), |l| (l.data, l.direct_map));
     let Some(served) = serve(
         selftest::CLIENT_BADGE,
         selftest::FAULT_BADGE,
-        mode::MAIN,
-        0,
+        [mode::MAIN, data, direct_map, 0],
         false,
     ) else {
         s.check("serve the sandbox", false, "receive failed");
         return;
     };
     section("sandbox containment");
-    let [vector, _, address, _] = served.end;
-    s.check(
-        "sandbox killed on its kernel memory access",
-        vector == vector::PAGE_FAULT && address >= 0xffff_8000_0000_0000,
-        format_args!("page fault at {address:#x}, reported with the fault badge"),
-    );
+    let [vector, error, address, _] = served.end;
+    let present = pf::PRESENT | pf::USER;
+    if layout.is_some() {
+        s.check(
+            "sandbox killed on its kernel memory access",
+            vector == vector::PAGE_FAULT && address == data && error & present == present,
+            format_args!("page fault at {address:#x} (live kernel data), error {error:#x}"),
+        );
+    } else {
+        s.check(
+            "sandbox killed on its kernel memory access",
+            vector == vector::PAGE_FAULT && address >= 0xffff_8000_0000_0000,
+            "page fault in the kernel half, reported with the fault badge",
+        );
+    }
     s.check(
         "every message carried the client's badge",
         !served.wrong_badge,
@@ -738,6 +866,20 @@ fn run_sandbox(s: &mut Suite) {
         served.failed == 0 && served.passed > 0,
         format_args!("{} checks passed, {} failed", served.passed, served.failed),
     );
+    s.expect_err(
+        "killed thread cannot be restarted",
+        k::thread_start(slot::SANDBOX_THREAD),
+        Error::Dead,
+    );
+    if layout.is_none() {
+        let _ = k::cap_delete(slot::SANDBOX_VSPACE);
+        let _ = k::cap_delete(slot::SANDBOX_THREAD);
+        s.skip(
+            "sandbox leak measurements",
+            "the kernel's counters exist in test kernels only",
+        );
+        return;
+    }
     let [_, m1, m2, m3] = served.marks;
     s.check(
         "2000 map/unmap cycles by the sandbox leak nothing",
@@ -748,11 +890,6 @@ fn run_sandbox(s: &mut Suite) {
         "hitting the page-table quota leaks nothing",
         no_growth(m1, m3),
         format_args!("{}", StatsLine(m3.unwrap_or_default())),
-    );
-    s.expect_err(
-        "killed thread cannot be restarted",
-        k::thread_start(slot::SANDBOX_THREAD),
-        Error::Dead,
     );
     // Dropping the last capability to the dead sandbox's address space returns
     // its memory to the kernel.
@@ -795,7 +932,7 @@ impl Display for Outcome {
 
 /// Starts one probe process per attack and checks that each ends exactly as it
 /// must — and that the kernel gets all of its resources back.
-fn run_probes(s: &mut Suite) {
+fn run_probes(s: &mut Suite, layout: &KernelLayout) {
     section("fault containment: one process per attack");
     let rwx = Rights::READ.union(Rights::WRITE).union(Rights::EXEC);
     let (mut min_freed, mut max_freed) = (u64::MAX, 0);
@@ -815,11 +952,20 @@ fn run_probes(s: &mut Suite) {
             && k::cap_mint(ENDPOINT, PROBE_FAULT, Rights::WRITE, fault).is_ok()
             && k::thread_set_fault_ep(thread, PROBE_FAULT).is_ok();
         let _ = k::cap_delete(PROBE_FAULT);
-        let mut argument = 0;
+        // Attacks on kernel memory aim at live kernel memory.
+        let target = match probe.target {
+            Target::None => 0,
+            Target::Code => layout.text,
+            Target::Data => layout.data,
+            Target::Stack => layout.stack,
+            Target::Heap => layout.heap,
+            Target::DirectMap => layout.direct_map,
+        };
+        let mut argument = target;
         if probe.mode == mode::FUZZ {
             // The fuzzer gets real capabilities so that its calls reach deep into
             // the kernel: a private frame, its address space, a memory budget.
-            argument = k::random();
+            argument = k::random(slot::ENTROPY).unwrap_or_default();
             println!("  fuzzer seed: {argument:#x}");
             ready &= k::retype(slot::UNTYPED, abi::obj::FRAME, FUZZ_FRAME).is_ok()
                 && k::thread_grant(thread, FUZZ_FRAME, sb::SHARED_FRAME, rwx, 0).is_ok()
@@ -839,8 +985,7 @@ fn run_probes(s: &mut Suite) {
             serve(
                 client,
                 fault,
-                probe.mode,
-                argument,
+                [probe.mode, argument, 0, 0],
                 probe.mode == mode::FUZZ,
             )
         } else {
@@ -856,13 +1001,18 @@ fn run_probes(s: &mut Suite) {
             continue;
         };
 
-        let [vector, error, ..] = served.end;
+        let [vector, error, address, _] = served.end;
         let exited = |code: u64| vector == abi::EXIT_VECTOR && error == code;
         let as_expected = match probe.expect {
             Expect::Fault {
                 vector: v,
                 error_bits,
             } => vector == v && error & error_bits == error_bits,
+            Expect::KernelFault { error_bits } => {
+                vector == vector::PAGE_FAULT
+                    && address == target
+                    && error & error_bits == error_bits
+            }
             Expect::FaultEither(a, b) => vector == a || vector == b,
             Expect::FaultOrNotApplicable(v) => vector == v || exited(selftest::EXIT_NOT_APPLICABLE),
             Expect::Exit(code) => exited(code),
@@ -899,6 +1049,205 @@ fn run_probes(s: &mut Suite) {
         min_freed > 16 && max_freed - min_freed <= 8,
         format_args!("{min_freed}..{max_freed} frames each"),
     );
+}
+
+/// Grants life-cycle probe `i` its client endpoint, its console and (with
+/// `server`) the receive right on the server endpoint, routes its report to the
+/// root task (or to the endpoint in slot `fault_ep`) and starts it.
+///
+/// The root task's capability to the probe's address space is dropped first: the
+/// kernel must reclaim the probe's memory the moment it dies.
+fn start_probe(i: u64, fault_ep: Option<u64>, server: bool) -> bool {
+    let thread = slot::PROBE_THREAD_FIRST + i;
+    let client = selftest::PROBE_CLIENT_BADGE + i;
+    let mut ok = k::thread_grant(thread, ENDPOINT, sb::ENDPOINT, Rights::WRITE, client).is_ok()
+        && k::thread_grant(thread, slot::CONSOLE, sb::CONSOLE, Rights::WRITE, 0).is_ok()
+        && (!server || k::thread_grant(thread, SERVER, sb::SERVER_EP, Rights::READ, 0).is_ok());
+    ok &= match fault_ep {
+        Some(ep) => k::thread_set_fault_ep(thread, ep).is_ok(),
+        None => {
+            let badge = selftest::PROBE_FAULT_BADGE + i;
+            let r = k::cap_mint(ENDPOINT, PROBE_FAULT, Rights::WRITE, badge)
+                .and_then(|()| k::thread_set_fault_ep(thread, PROBE_FAULT));
+            let _ = k::cap_delete(PROBE_FAULT);
+            r.is_ok()
+        }
+    };
+    let _ = k::cap_delete(slot::PROBE_VSPACE_FIRST + i);
+    ok && k::thread_start(thread).is_ok()
+}
+
+/// Receives probe `i`'s first message and tells it its role.
+fn hello(i: u64, mode: u64) -> bool {
+    match k::recv(ENDPOINT, None) {
+        Ok(m) if m.words[0] == selftest::HELLO && m.badge == selftest::PROBE_CLIENT_BADGE + i => {
+            k::reply([mode, 0, 0, 0]).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// Runs probe `i` in `mode` under [`serve`].
+fn supervise(i: u64, mode: u64, server: bool) -> Option<Served> {
+    let served = if start_probe(i, None, server) {
+        serve(
+            selftest::PROBE_CLIENT_BADGE + i,
+            selftest::PROBE_FAULT_BADGE + i,
+            [mode, 0, 0, 0],
+            false,
+        )
+    } else {
+        None
+    };
+    let _ = k::cap_delete(slot::PROBE_THREAD_FIRST + i);
+    served.filter(|sv| !sv.wrong_badge)
+}
+
+/// `true` if the probe exited normally with [`selftest::EXIT_OK`].
+fn exited_ok(served: Option<&Served>) -> bool {
+    served.is_some_and(|sv| sv.end == [abi::EXIT_VECTOR, selftest::EXIT_OK, 0, 0])
+}
+
+/// `true` if exactly one process, its `caps` capabilities and its memory went
+/// away between `alive` and `gone`.
+fn one_process_gone(alive: Option<KernelStats>, gone: Option<KernelStats>, caps: u64) -> bool {
+    match (alive, gone) {
+        (Some(a), Some(g)) => {
+            g.threads + 1 == a.threads
+                && g.capabilities + caps == a.capabilities
+                && g.free_frames > a.free_frames + 16
+        }
+        _ => false,
+    }
+}
+
+/// Process life cycle: calls that can never be answered, processes that die
+/// while nobody listens, and processes killed from outside. Each test must end
+/// with every thread unblocked and every resource returned — a kernel that got
+/// one of them wrong would leave a thread waiting forever (and this suite would
+/// hang until the test harness times out).
+fn lifecycle_tests(s: &mut Suite) {
+    section("process life cycle");
+    if k::retype(slot::UNTYPED, abi::obj::ENDPOINT, SERVER).is_err() {
+        s.check("create the server endpoint", false, "retype failed");
+        return;
+    }
+    let first = selftest::ATTACKS as u64;
+
+    // 1. A server that receives again without replying.
+    let served = supervise(first, mode::ABANDONED_CALL, false);
+    s.check(
+        "a server that receives again without replying releases its caller",
+        exited_ok(served.as_ref()),
+        "the abandoned call returned EDEAD",
+    );
+
+    // 2. A server that dies while it owes a reply.
+    let served = supervise(first + 1, mode::SERVER_DIES, true);
+    let call = served.as_ref().and_then(|sv| sv.call);
+    s.check(
+        "a server that dies holding a call releases its caller",
+        exited_ok(served.as_ref()) && call == Some(Err(Error::Dead)),
+        format_args!(
+            "the call returned {:?}",
+            call.map(|r| r.map_err(Error::name))
+        ),
+    );
+
+    // 3. A process dies while nobody receives its report.
+    let served = supervise(first + 2, mode::ZOMBIE, false);
+    let (alive, dead) = served.as_ref().map_or((None, None), |sv| sv.zombie);
+    let reclaimed = match (alive, dead) {
+        (Some(a), Some(d)) => {
+            d.capabilities + 2 == a.capabilities
+                && d.free_frames > a.free_frames + 16
+                && d.threads == a.threads
+        }
+        _ => false,
+    };
+    s.check(
+        "a dead process returns its memory before its report is collected",
+        exited_ok(served.as_ref()) && reclaimed,
+        format_args!(
+            "{} frames back while the report was still waiting",
+            dead.map_or(0, |d| d.free_frames)
+                .saturating_sub(alive.map_or(0, |a| a.free_frames))
+        ),
+    );
+
+    // 4. A process dies and nobody can ever receive its report: the only
+    //    capability to its fault endpoint is gone.
+    let i = first + 3;
+    let thread = slot::PROBE_THREAD_FIRST + i;
+    let started = k::retype(slot::UNTYPED, abi::obj::ENDPOINT, ORPHAN).is_ok()
+        && start_probe(i, Some(ORPHAN), false);
+    let _ = k::cap_delete(ORPHAN);
+    let alive = (started && hello(i, mode::ORPHANED_REPORT))
+        .then(|| k::kernel_stats(slot::CONSOLE).ok())
+        .flatten();
+    let gone = settle(|now| alive.is_some_and(|a| now.threads < a.threads));
+    let _ = k::cap_delete(thread);
+    s.check(
+        "a report nobody can receive does not keep the process alive",
+        one_process_gone(alive, gone, 2)
+            && alive
+                .zip(gone)
+                .is_some_and(|(a, g)| g.endpoints + 1 == a.endpoints),
+        "process, memory and its orphaned fault endpoint all reclaimed",
+    );
+
+    // 5. Kill a running process.
+    let i = first + 4;
+    let thread = slot::PROBE_THREAD_FIRST + i;
+    let started = start_probe(i, None, false) && hello(i, mode::SPIN);
+    for _ in 0..3 {
+        k::yield_now(); // the probe spins until the timer preempts it
+    }
+    let _ = k::cap_mint(thread, SCRATCH, Rights::READ, 0);
+    s.expect_err(
+        "killing needs WRITE on the thread capability",
+        k::thread_kill(SCRATCH),
+        Error::PermissionDenied,
+    );
+    let _ = k::cap_delete(SCRATCH);
+    let alive = k::kernel_stats(slot::CONSOLE).ok();
+    let killed = k::thread_kill(thread);
+    let gone = k::kernel_stats(slot::CONSOLE).ok();
+    s.check(
+        "kill a running process from outside",
+        started && killed.is_ok() && one_process_gone(alive, gone, 2),
+        "thread, capabilities and memory reclaimed at once",
+    );
+    s.expect_err(
+        "a killed process cannot be killed again",
+        k::thread_kill(thread),
+        Error::Dead,
+    );
+    s.expect_err(
+        "a killed process cannot be restarted",
+        k::thread_start(thread),
+        Error::Dead,
+    );
+    let _ = k::cap_delete(thread);
+
+    // 6. Kill a process blocked in IPC (the self-audit checks that no endpoint
+    //    queue still names it).
+    let i = first + 5;
+    let thread = slot::PROBE_THREAD_FIRST + i;
+    let started = start_probe(i, None, true) && hello(i, mode::BLOCK);
+    k::yield_now(); // the probe blocks in recv on the server endpoint
+    let alive = k::kernel_stats(slot::CONSOLE).ok();
+    let killed = k::thread_kill(thread);
+    let gone = k::kernel_stats(slot::CONSOLE).ok();
+    let _ = k::cap_delete(thread);
+    s.check(
+        "kill a process blocked in IPC",
+        // (it also held the receive right on the server endpoint)
+        started && killed.is_ok() && one_process_gone(alive, gone, 3),
+        "removed from the endpoint queue, everything reclaimed",
+    );
+
+    let _ = k::cap_delete(SERVER);
     let end = k::kernel_stats(slot::CONSOLE).unwrap_or_default();
     s.check(
         "only the root task is left",
@@ -910,28 +1259,57 @@ fn run_probes(s: &mut Suite) {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     k::set_console(slot::CONSOLE);
-    println!(
-        "Kalkan root task running at {:#x} (randomised)",
-        _start as *const () as usize
-    );
-    println!("Running the adversarial security test suite...");
+    // Only a test kernel reveals its layout (and offers the other diagnostics).
+    let layout = k::kernel_layout(slot::CONSOLE).ok();
+    if layout.is_some() {
+        println!(
+            "Kalkan root task running at {:#x} (randomised)",
+            _start as *const () as usize
+        );
+        println!("Running the adversarial security test suite on a test kernel...");
+    } else {
+        println!("Kalkan root task running");
+        println!("Running the adversarial security test suite (not a test kernel)...");
+    }
     let mut s = Suite {
         passed: 0,
         failed: 0,
+        skipped: 0,
     };
     capability_tests(&mut s);
+    kernel_interface_tests(&mut s, layout.is_some());
     pointer_tests(&mut s);
     memory_tests(&mut s);
     copy_tests(&mut s);
     quota_tests(&mut s);
-    leak_tests(&mut s);
+    if layout.is_some() {
+        leak_tests(&mut s);
+    } else {
+        s.skip(
+            "kernel resource leaks",
+            "the kernel's counters exist in test kernels only",
+        );
+    }
     if setup_sandbox(&mut s) {
-        run_sandbox(&mut s);
-        run_probes(&mut s);
+        run_sandbox(&mut s, layout);
+        if let Some(layout) = layout {
+            run_probes(&mut s, &layout);
+            lifecycle_tests(&mut s);
+        } else {
+            s.skip(
+                "fault containment probes and process life cycle",
+                "probe processes exist in test kernels only",
+            );
+        }
     }
     println!("==================================================================");
-    if s.failed == 0 {
+    if s.failed == 0 && s.skipped == 0 {
         println!("KALKAN-TEST: PASS - all {} security tests passed", s.passed);
+    } else if s.failed == 0 {
+        println!(
+            "KALKAN-TEST: PASS - all {} security tests passed ({} groups skipped: not a test kernel)",
+            s.passed, s.skipped
+        );
     } else {
         println!(
             "KALKAN-TEST: FAIL - {} of {} security tests failed",

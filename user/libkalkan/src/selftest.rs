@@ -5,6 +5,11 @@
 //! plays (`HELLO`). The *main* sandbox runs the non-fatal escape attempts; every
 //! *probe* performs exactly one attack that the CPU or the kernel must stop, and
 //! the supervisor checks that the probe was terminated in exactly the expected way.
+//! The last few probes take part in process life-cycle tests instead (calls that
+//! can never be answered, processes that die while nobody listens, processes
+//! killed from outside).
+//!
+//! Probes exist only in test kernels (`selftest` feature).
 
 /// Badge of the main sandbox's client capability to the root task's endpoint.
 pub const CLIENT_BADGE: u64 = 0xc11e47;
@@ -15,8 +20,17 @@ pub const PROBE_CLIENT_BADGE: u64 = 0x9b0b_e000;
 /// Fault badge of probe `i` is `PROBE_FAULT_BADGE + i`.
 pub const PROBE_FAULT_BADGE: u64 = 0xfa17_e000;
 
-/// `[HELLO, 0, 0, 0]` → reply `[mode, argument, 0, 0]`.
+/// `[HELLO, 0, 0, 0]` → reply `[mode, argument, argument2, 0]`.
+///
+/// The main sandbox gets the addresses of kernel data and of the kernel's direct
+/// map (0 on kernels that do not reveal them), a memory probe the address it
+/// attacks, the fuzzer its seed.
 pub const HELLO: u64 = 0x4b48_454c_4c4f;
+/// `[ABANDON, 0, 0, 0]`, sent with `call`: the supervisor receives it and then
+/// receives again without replying, which must release the caller with `EDEAD`.
+pub const ABANDON: u64 = 0x4b41_4241_4e44;
+/// `[HOLD, 0, 0, 0]`: the call a server probe receives and never answers.
+pub const HOLD: u64 = 0x4b48_4f4c_4400;
 /// `[REPORT, test_id, passed, 0]`.
 pub const REPORT: u64 = 0x4b52_4550_4f52;
 /// `[TRANSFER, 0, 0, 0]` + a capability; the reply carries the message info flags.
@@ -56,6 +70,8 @@ pub mod slot {
     pub const FIRST_FREE: u64 = 8;
     /// Fuzzer only: a delegated untyped budget.
     pub const FUZZ_UNTYPED: u64 = 9;
+    /// Life-cycle probes only: receive right on an endpoint the supervisor calls.
+    pub const SERVER_EP: u64 = 10;
 }
 
 /// x86 exception vectors.
@@ -131,6 +147,45 @@ pub mod mode {
     pub const REGISTER_INTEGRITY: u64 = 45;
     pub const SILENT_EXIT: u64 = 46;
     pub const FUZZ: u64 = 47;
+    pub const READ_KERNEL_CODE: u64 = 48;
+    pub const READ_KERNEL_DATA: u64 = 49;
+    pub const READ_KERNEL_STACK: u64 = 50;
+    pub const READ_KERNEL_HEAP: u64 = 51;
+    pub const WRITE_KERNEL_CODE: u64 = 52;
+    pub const WRITE_KERNEL_STACK: u64 = 53;
+    pub const WRITE_PHYSMAP: u64 = 54;
+    // Process life cycle.
+    /// Calls the supervisor, which abandons the call.
+    pub const ABANDONED_CALL: u64 = 60;
+    /// Receives a call and exits without answering it.
+    pub const SERVER_DIES: u64 = 61;
+    /// Exits at once, while nobody receives its report.
+    pub const ZOMBIE: u64 = 62;
+    /// Exits at once; nobody can ever receive its report.
+    pub const ORPHANED_REPORT: u64 = 63;
+    /// Spins until it is killed.
+    pub const SPIN: u64 = 64;
+    /// Blocks in `recv` until it is killed.
+    pub const BLOCK: u64 = 65;
+}
+
+/// Kernel memory a probe attacks. The supervisor looks the address up with
+/// `kernel_layout` and hands it to the probe, so that the attack hits live kernel
+/// memory wherever KASLR placed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// The probe does not attack kernel memory.
+    None,
+    /// Kernel code.
+    Code,
+    /// Kernel writable data.
+    Data,
+    /// The kernel stack.
+    Stack,
+    /// A live kernel heap object.
+    Heap,
+    /// The kernel image through the kernel's direct map of physical memory.
+    DirectMap,
 }
 
 /// How a probe is expected to end.
@@ -138,6 +193,10 @@ pub mod mode {
 pub enum Expect {
     /// Killed by this exception; for page faults `error_bits` must all be set.
     Fault { vector: u64, error_bits: u64 },
+    /// Killed by a page fault at exactly the attacked kernel address, with all
+    /// `error_bits` set. They always include `pf::PRESENT`: the page *is* mapped,
+    /// so it was the privilege check that stopped the access, not a missing page.
+    KernelFault { error_bits: u64 },
     /// Killed by one of two exceptions (CPU vendors differ).
     FaultEither(u64, u64),
     /// Killed by this exception, or "not applicable" if the CPU lacks the feature.
@@ -153,60 +212,120 @@ pub struct Probe {
     pub mode: u64,
     /// What the probe attempts.
     pub name: &'static str,
+    /// The kernel memory it attacks, if any.
+    pub target: Target,
     /// How it must end.
     pub expect: Expect,
 }
 
-const fn fault(mode: u64, name: &'static str, vector: u64) -> Probe {
+const fn probe(mode: u64, name: &'static str, expect: Expect) -> Probe {
     Probe {
         mode,
         name,
-        expect: Expect::Fault {
-            vector,
-            error_bits: 0,
-        },
+        target: Target::None,
+        expect,
     }
 }
 
+const fn fault(mode: u64, name: &'static str, vector: u64) -> Probe {
+    probe(
+        mode,
+        name,
+        Expect::Fault {
+            vector,
+            error_bits: 0,
+        },
+    )
+}
+
 const fn page_fault(mode: u64, name: &'static str, error_bits: u64) -> Probe {
+    probe(
+        mode,
+        name,
+        Expect::Fault {
+            vector: vector::PAGE_FAULT,
+            error_bits,
+        },
+    )
+}
+
+const fn kernel_fault(mode: u64, name: &'static str, target: Target, access: u64) -> Probe {
     Probe {
         mode,
         name,
-        expect: Expect::Fault {
-            vector: vector::PAGE_FAULT,
-            error_bits,
+        target,
+        expect: Expect::KernelFault {
+            error_bits: pf::PRESENT | pf::USER | access,
         },
     }
 }
 
 const fn exits(mode: u64, name: &'static str, code: u64) -> Probe {
-    Probe {
-        mode,
-        name,
-        expect: Expect::Exit(code),
-    }
+    probe(mode, name, Expect::Exit(code))
 }
 
 use vector::{GENERAL_PROTECTION as GP, INVALID_OPCODE as UD};
 
+/// Number of probe processes used by the process life-cycle tests (the last ones).
+pub const LIFECYCLE_PROBES: usize = 6;
+
+/// Number of fault-containment tests (the first probe processes).
+pub const ATTACKS: usize = kcore::abi::PROBE_COUNT as usize - LIFECYCLE_PROBES;
+
 /// Every fault-containment test, in the order they are run.
-pub const PROBES: [Probe; kcore::abi::PROBE_COUNT as usize] = [
-    // --- memory isolation, enforced by the MMU
-    page_fault(
-        mode::WRITE_KERNEL,
-        "write to kernel memory",
-        pf::WRITE | pf::USER,
+pub const PROBES: [Probe; ATTACKS] = [
+    // --- kernel memory at its real (randomised) addresses, enforced by the MMU
+    kernel_fault(mode::READ_KERNEL_CODE, "read kernel code", Target::Code, 0),
+    kernel_fault(
+        mode::WRITE_KERNEL_CODE,
+        "overwrite kernel code",
+        Target::Code,
+        pf::WRITE,
     ),
-    page_fault(
-        mode::READ_PHYSMAP,
-        "read the kernel's direct map of physical memory",
-        pf::USER,
-    ),
-    page_fault(
+    kernel_fault(
         mode::EXEC_KERNEL,
         "jump to kernel code",
-        pf::FETCH | pf::USER,
+        Target::Code,
+        pf::FETCH,
     ),
+    kernel_fault(mode::READ_KERNEL_DATA, "read kernel data", Target::Data, 0),
+    kernel_fault(
+        mode::WRITE_KERNEL,
+        "write to kernel data",
+        Target::Data,
+        pf::WRITE,
+    ),
+    kernel_fault(
+        mode::READ_KERNEL_STACK,
+        "read the kernel stack",
+        Target::Stack,
+        0,
+    ),
+    kernel_fault(
+        mode::WRITE_KERNEL_STACK,
+        "overwrite the kernel stack",
+        Target::Stack,
+        pf::WRITE,
+    ),
+    kernel_fault(
+        mode::READ_KERNEL_HEAP,
+        "read a kernel heap object",
+        Target::Heap,
+        0,
+    ),
+    kernel_fault(
+        mode::READ_PHYSMAP,
+        "read the kernel through the direct map of physical memory",
+        Target::DirectMap,
+        0,
+    ),
+    kernel_fault(
+        mode::WRITE_PHYSMAP,
+        "write the kernel through the direct map of physical memory",
+        Target::DirectMap,
+        pf::WRITE,
+    ),
+    // --- memory isolation within the process
     page_fault(
         mode::WRITE_CODE,
         "overwrite its own code (W^X)",
@@ -274,25 +393,25 @@ pub const PROBES: [Probe; kcore::abi::PROBE_COUNT as usize] = [
     // --- timing and address disclosure
     fault(mode::RDTSC, "read the time stamp counter (rdtsc)", GP),
     fault(mode::RDPMC, "read a performance counter (rdpmc)", GP),
-    Probe {
-        mode: mode::SGDT,
-        name: "read the GDT address (sgdt, UMIP)",
-        expect: Expect::FaultOrNotApplicable(GP),
-    },
-    Probe {
-        mode: mode::SIDT,
-        name: "read the IDT address (sidt, UMIP)",
-        expect: Expect::FaultOrNotApplicable(GP),
-    },
+    probe(
+        mode::SGDT,
+        "read the GDT address (sgdt, UMIP)",
+        Expect::FaultOrNotApplicable(GP),
+    ),
+    probe(
+        mode::SIDT,
+        "read the IDT address (sidt, UMIP)",
+        Expect::FaultOrNotApplicable(GP),
+    ),
     // --- CPU state the kernel does not save
     fault(mode::SSE, "use SSE registers", UD),
     fault(mode::X87, "use the x87 FPU", vector::DEVICE_NOT_AVAILABLE),
     fault(mode::AVX, "use AVX registers", UD),
-    Probe {
-        mode: mode::XSETBV,
-        name: "enable extended state (xsetbv)",
-        expect: Expect::FaultEither(UD, GP),
-    },
+    probe(
+        mode::XSETBV,
+        "enable extended state (xsetbv)",
+        Expect::FaultEither(UD, GP),
+    ),
     fault(mode::WRGSBASE, "change the GS base (wrgsbase)", UD),
     // --- privilege level games
     fault(mode::IRET_TO_RING0, "iretq into ring 0", GP),
@@ -302,11 +421,11 @@ pub const PROBES: [Probe; kcore::abi::PROBE_COUNT as usize] = [
         GP,
     ),
     fault(mode::LOAD_KERNEL_SS, "load the kernel stack segment", GP),
-    Probe {
-        mode: mode::SYSENTER,
-        name: "enter the kernel through sysenter",
-        expect: Expect::FaultEither(GP, UD),
-    },
+    probe(
+        mode::SYSENTER,
+        "enter the kernel through sysenter",
+        Expect::FaultEither(GP, UD),
+    ),
     // --- ordinary crashes are contained too
     fault(mode::DIVIDE_BY_ZERO, "divide by zero", vector::DIVIDE_ERROR),
     fault(mode::UD2, "execute an undefined instruction", UD),

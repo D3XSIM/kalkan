@@ -2,10 +2,16 @@
 //!
 //! ```text
 //! cargo xtask build [--debug]   build everything and assemble the boot partition
-//! cargo xtask run   [--debug]   build and boot in QEMU (serial console on stdout)
+//! cargo xtask run   [--debug]   build a test kernel and boot it in QEMU (serial
+//!                               console on stdout)
 //! cargo xtask check             static checks of the project's security claims
 //! cargo xtask test  [--quick]   static checks + every QEMU scenario (what CI runs)
 //! ```
+//!
+//! `build` produces a normal kernel. `run` and `test` build a *test kernel*
+//! (feature `selftest`): it creates the probe processes of the adversarial suite,
+//! offers two diagnostic system calls and prints addresses in its log. `test`
+//! additionally boots a normal kernel to check that it has none of that.
 //!
 //! The build is a small chain of trust:
 //!
@@ -42,12 +48,23 @@ fn main() -> ExitCode {
     let flag = |name: &str| args.iter().any(|a| a == name);
     let release = !flag("--debug");
     let result = match args.first().map(String::as_str) {
-        Some("build") => build(release, "").map(|_| ()),
-        Some("run") => build(release, "qemu-exit").and_then(|esp| qemu::run_interactive(&esp)),
+        Some("build") => build(release, "", "esp").map(|_| ()),
+        Some("run") => {
+            build(release, "qemu-exit,selftest", "esp").and_then(|esp| qemu::run_interactive(&esp))
+        }
         Some("check") => checks::run(),
-        Some("test") => checks::run()
-            .and_then(|()| build(true, "qemu-exit,audit"))
-            .and_then(|esp| scenarios::run(&esp, flag("--quick"))),
+        Some("test") => checks::run().and_then(|()| {
+            let quick = flag("--quick");
+            // The production kernel is built first: both share one output path,
+            // and each boot partition keeps its own copy.
+            let production = if quick {
+                None
+            } else {
+                Some(build(true, "qemu-exit", "esp-production")?)
+            };
+            let esp = build(true, "qemu-exit,audit,selftest", "esp")?;
+            scenarios::run(&esp, production.as_deref(), quick)
+        }),
         _ => {
             eprintln!("usage: cargo xtask <build|run|check|test> [--debug] [--quick]");
             return ExitCode::from(2);
@@ -110,8 +127,9 @@ fn write(path: &Path, data: &[u8]) -> Result<()> {
     fs::write(path, data).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
-/// Builds the user programs and the kernel and assembles the EFI system partition.
-fn build(release: bool, features: &str) -> Result<PathBuf> {
+/// Builds the user programs and the kernel (with `features`) and assembles the
+/// EFI system partition in `target/<esp_name>`.
+fn build(release: bool, features: &str, esp_name: &str) -> Result<PathBuf> {
     step("building user programs (release)");
     let mut cmd = cargo();
     cmd.args([
@@ -144,8 +162,13 @@ fn build(release: bool, features: &str) -> Result<PathBuf> {
     }
 
     step(&format!(
-        "building kernel ({})",
-        if release { "release" } else { "debug" }
+        "building kernel ({}, features: {})",
+        if release { "release" } else { "debug" },
+        if features.is_empty() {
+            "none"
+        } else {
+            features
+        }
     ));
     let mut cmd = cargo();
     cmd.args(["build", "--target", TARGET, "-p", "kalkan-kernel"]);
@@ -170,7 +193,7 @@ fn build(release: bool, features: &str) -> Result<PathBuf> {
     let limine = fetch_limine()?;
 
     step("assembling the EFI system partition");
-    let esp = target_dir().join("esp");
+    let esp = target_dir().join(esp_name);
     if esp.exists() {
         fs::remove_dir_all(&esp).map_err(|e| format!("cleaning {}: {e}", esp.display()))?;
     }

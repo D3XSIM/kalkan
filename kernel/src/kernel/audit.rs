@@ -1,9 +1,10 @@
 //! Kernel self-audit.
 //!
 //! The kernel keeps several derived quantities for speed: reference counts,
-//! per-frame mapping counters, budget balances, scheduler and IPC queues. A bug in
-//! any path that maintains them could turn into a use-after-free of physical
-//! memory or a capability that outlives its object.
+//! per-frame mapping counters, budget balances, scheduler and IPC queues, the
+//! call/reply bookkeeping and the state of terminated threads. A bug in any path
+//! that maintains them could turn into a use-after-free of physical memory, a
+//! capability that outlives its object, or a thread that waits forever.
 //!
 //! [`Kernel::audit`] recomputes every one of these quantities **from first
 //! principles** (by walking all capabilities, threads and page tables) and
@@ -11,6 +12,14 @@
 //! by `cargo xtask test` — it runs after *every* trap, so the adversarial test
 //! suite and the system call fuzzer check the complete object graph thousands of
 //! times; without the feature it still runs once at shutdown.
+//!
+//! Page tables are checked in both directions: every mapping a capability
+//! records must be in the page tables (every audit), and every page present in
+//! the page tables must be accounted for by a capability or by the program image
+//! the kernel loaded — never writable and executable at once — while the number
+//! of page tables must match the quota counter (every
+//! [`PAGE_WALK_INTERVAL`]-th audit and at boot and shutdown, as walking every
+//! table is slow).
 
 use alloc::format;
 use alloc::string::String;
@@ -18,6 +27,11 @@ use alloc::vec::Vec;
 
 use super::Kernel;
 use super::object::*;
+use crate::mm::paging::ADDR_MASK;
+use crate::mm::paging::flags::{HUGE, NO_EXECUTE, USER, WRITABLE};
+
+/// Every how many audits the user page tables are walked completely.
+pub const PAGE_WALK_INTERVAL: u64 = 64;
 
 type Audit = Result<(), String>;
 
@@ -35,6 +49,8 @@ pub struct Census {
     pub vspaces: usize,
     pub untypeds: usize,
     pub mappings: usize,
+    /// User page tables (counted when the page tables were walked).
+    pub page_tables: usize,
 }
 
 impl Kernel {
@@ -59,7 +75,7 @@ impl Kernel {
                 Object::VSpace(id) => self.vspaces.contains(id),
                 Object::Endpoint(id) => self.endpoints.contains(id),
                 // Thread capabilities are weak references by design.
-                Object::Thread(_) | Object::Console => true,
+                Object::Thread(_) | Object::Console | Object::Entropy => true,
             };
             ensure(alive, || {
                 format!("capability to a destroyed object: {obj:?}")
@@ -132,19 +148,26 @@ impl Kernel {
         for (id, e) in self.endpoints.iter() {
             census.endpoints += 1;
             let cap_refs = caps.iter().filter(|o| **o == Object::Endpoint(id)).count();
-            let fault_refs = self
+            let handlers = self
                 .threads
                 .iter()
                 .filter(|(_, t)| t.fault_ep.is_some_and(|(ep, _)| ep == id))
                 .count();
             ensure(
-                e.refs as usize == cap_refs + fault_refs && e.refs > 0,
+                e.refs as usize == cap_refs
+                    && e.handlers as usize == handlers
+                    && cap_refs + handlers > 0,
                 || {
                     format!(
-                        "endpoint {id:?}: refs {} but {cap_refs} capabilities + {fault_refs} fault handlers",
-                        e.refs
+                        "endpoint {id:?}: refs {}/handlers {} but {cap_refs} capabilities + \
+                         {handlers} fault handlers",
+                        e.refs, e.handlers
                     )
                 },
+            )?;
+            ensure(
+                cap_refs > 0 || (e.senders.is_empty() && e.receivers.is_empty()),
+                || format!("endpoint {id:?} has no capabilities but threads waiting on it"),
             )?;
             ensure(e.senders.is_empty() || e.receivers.is_empty(), || {
                 format!("endpoint {id:?} has senders and receivers waiting at once")
@@ -169,7 +192,11 @@ impl Kernel {
         for (id, v) in self.vspaces.iter() {
             census.vspaces += 1;
             let cap_refs = caps.iter().filter(|o| **o == Object::VSpace(id)).count();
-            let thread_refs = self.threads.iter().filter(|(_, t)| t.vspace == id).count();
+            let thread_refs = self
+                .threads
+                .iter()
+                .filter(|(_, t)| t.vspace == id && !t.zombie)
+                .count();
             ensure(
                 v.refs as usize == cap_refs + thread_refs && v.refs > 0,
                 || {
@@ -179,6 +206,39 @@ impl Kernel {
                     )
                 },
             )?;
+        }
+
+        // --- page tables, the other way round (see the module documentation)
+        if !scheduling || self.stats.audits.is_multiple_of(PAGE_WALK_INTERVAL) {
+            for (id, v) in self.vspaces.iter() {
+                let mut stray: Option<(u64, u64)> = None;
+                let (found, counted) = v.space.census(&mut |vaddr, entry| {
+                    let phys = entry & ADDR_MASK;
+                    let writable = entry & WRITABLE != 0;
+                    let executable = entry & NO_EXECUTE == 0;
+                    let by_capability = mappings.iter().any(|(f, m)| {
+                        m.vspace == id
+                            && m.vaddr == vaddr
+                            && m.writable == writable
+                            && m.executable == executable
+                            && self.frames.get(*f).is_some_and(|fr| fr.phys == phys)
+                    });
+                    let loaded = v.owned_frames.contains(&phys);
+                    let sound = entry & USER != 0 && entry & HUGE == 0 && !(writable && executable);
+                    if stray.is_none() && !(sound && (by_capability || loaded)) {
+                        stray = Some((vaddr, entry));
+                    }
+                });
+                if let Some((vaddr, entry)) = stray {
+                    return Err(format!(
+                        "vspace {id:?}: page {vaddr:#x} (entry {entry:#x}) is unaccounted for"
+                    ));
+                }
+                ensure(found == counted, || {
+                    format!("vspace {id:?}: {found} page tables exist, the quota counts {counted}")
+                })?;
+                census.page_tables += found as usize;
+            }
         }
 
         // --- untyped budgets: nothing is created or lost
@@ -213,12 +273,44 @@ impl Kernel {
         // --- threads
         for (id, t) in self.threads.iter() {
             census.threads += 1;
-            ensure(self.caps.space_exists(t.cspace), || {
-                format!("thread {id:?} lost its CSpace")
-            })?;
-            ensure(self.vspaces.contains(t.vspace), || {
-                format!("thread {id:?} lost its VSpace")
-            })?;
+            if t.zombie {
+                // Terminated: everything is released, only the final report is left.
+                ensure(
+                    matches!(t.state, ThreadState::BlockedSend(_)) && t.outgoing.fault,
+                    || format!("terminated thread {id:?} is {:?}, not reporting", t.state),
+                )?;
+                ensure(
+                    !self.caps.space_exists(t.cspace) && t.reply_to.is_none(),
+                    || format!("terminated thread {id:?} still holds capabilities or a caller"),
+                )?;
+            } else {
+                ensure(self.caps.space_exists(t.cspace), || {
+                    format!("thread {id:?} lost its CSpace")
+                })?;
+                ensure(self.vspaces.contains(t.vspace), || {
+                    format!("thread {id:?} lost its VSpace")
+                })?;
+            }
+            // Call/reply: a waiting caller is owed its reply by exactly one live
+            // thread, and a thread that owes a reply owes it to a waiting caller.
+            if t.state == ThreadState::BlockedReply {
+                let owed_by = self
+                    .threads
+                    .iter()
+                    .filter(|(_, s)| s.reply_to == Some(id))
+                    .count();
+                ensure(owed_by == 1, || {
+                    format!("thread {id:?} waits for a reply owed by {owed_by} threads")
+                })?;
+            }
+            if let Some(caller) = t.reply_to {
+                ensure(
+                    self.threads
+                        .get(caller)
+                        .is_none_or(|c| c.state == ThreadState::BlockedReply),
+                    || format!("thread {id:?} owes a reply to {caller:?}, which is not waiting"),
+                )?;
+            }
             if let Some((ep, _)) = t.fault_ep {
                 ensure(self.endpoints.contains(ep), || {
                     format!("thread {id:?} has a destroyed fault endpoint")

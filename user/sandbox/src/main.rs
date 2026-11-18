@@ -8,7 +8,7 @@
 //!   smuggle capabilities, exhaust kernel memory and finally read kernel memory;
 //! * each **probe** ([`probes`]) performs one attack on the hardware-enforced
 //!   boundary (privileged instructions, kernel memory, W^X, ...) that must get it
-//!   killed — and only it;
+//!   killed — and only it — or plays its part in a process life-cycle test;
 //! * the **fuzzer** ([`fuzz`]) throws tens of thousands of random system calls at
 //!   the kernel.
 
@@ -30,8 +30,8 @@ pub extern "C" fn _start() -> ! {
         k::thread_exit(selftest::EXIT_CHECK_FAILED)
     };
     match role[0] {
-        mode::MAIN => suite::run(),
+        mode::MAIN => suite::run(role[1], role[2]),
         mode::FUZZ => fuzz::run(role[1]),
-        other => probes::run(other),
+        other => probes::run(other, role[1]),
     }
 }

@@ -253,6 +253,37 @@ pub fn set_pml4_entry(pml4: u64, index: usize, value: u64) {
     unsafe { (*table(pml4))[index & 511] = value };
 }
 
+/// Visits every present leaf entry of the *user half* of an address space as
+/// `(virtual address, entry)` and returns the number of page-table frames below
+/// the PML4. Used by the kernel's self-audit.
+pub fn walk_user(pml4: u64, leaf: &mut dyn FnMut(u64, u64)) -> u32 {
+    fn walk(table_phys: u64, level: u32, base: u64, leaf: &mut dyn FnMut(u64, u64)) -> u32 {
+        let mut tables = 0;
+        for i in 0..512u64 {
+            // SAFETY: valid table frame in the direct map; `i` < 512.
+            let entry = unsafe { (*table(table_phys))[i as usize] };
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            let va = base | (i << (12 + 9 * level));
+            if level == 0 || entry & HUGE != 0 {
+                leaf(va, entry);
+            } else {
+                tables += 1 + walk(entry & ADDR_MASK, level - 1, va, leaf);
+            }
+        }
+        tables
+    }
+    let mut tables = 0;
+    for i in 0..256 {
+        let entry = pml4_entry(pml4, i);
+        if entry & PRESENT != 0 {
+            tables += 1 + walk(entry & ADDR_MASK, 2, (i as u64) << 39, leaf);
+        }
+    }
+    tables
+}
+
 /// Frees every page table frame of the *user half* of an address space (the
 /// tables only; leaf frames belong to their owners).
 pub fn free_user_tables(pml4: u64) {

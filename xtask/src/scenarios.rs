@@ -1,13 +1,17 @@
 //! Whole-system test scenarios.
 //!
-//! 1. **The adversarial suite** on several machines (little memory, memory above
-//!    4 GiB): every test must pass, the kernel's self-audit must hold, and nothing
-//!    printed by an untrusted process may contain terminal escape sequences.
-//! 2. **Randomisation**: kernel image, direct map, kernel regions and user programs
+//! 1. **The adversarial suite** on a test kernel on several machines (little
+//!    memory, memory above 4 GiB, local APIC in x2APIC and in xAPIC mode): every
+//!    test must pass, the kernel's self-audit must hold, and nothing printed by an
+//!    untrusted process may contain terminal escape sequences.
+//! 2. **A production kernel** (no `selftest` feature) must have none of the test
+//!    facilities, must keep every address out of its log, and must still pass
+//!    every test that does not depend on them.
+//! 3. **Randomisation**: kernel image, direct map, kernel regions and user programs
 //!    must land at different addresses on different boots.
-//! 3. **Fail-closed CPU checks**: on CPUs without NX, SMEP or SMAP the kernel must
+//! 4. **Fail-closed CPU checks**: on CPUs without NX, SMEP or SMAP the kernel must
 //!    refuse to boot.
-//! 4. **Boot chain tampering**: modified, swapped, added or missing boot modules
+//! 5. **Boot chain tampering**: modified, swapped, added or missing boot modules
 //!    and a modified kernel must never reach user space.
 
 use std::fs;
@@ -23,6 +27,7 @@ const REFUSAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Facts extracted from the log of a successful suite run.
 #[derive(Debug)]
 struct Facts {
+    apic: String,
     kernel_image: String,
     direct_map: String,
     kernel_regions: String,
@@ -35,18 +40,13 @@ fn fact(boot: &Boot, marker: &str) -> Result<String> {
         .ok_or_else(|| format!("log line with `{marker}` not found"))
 }
 
-/// Runs the adversarial suite and verifies the complete log.
-fn suite(esp: &Path, machine: &Machine<'_>, log: &str, echo: bool) -> Result<Facts> {
-    step(&format!(
-        "security suite on {} RAM, CPU `{}`",
-        machine.memory, machine.cpu
-    ));
-    // A bootloader panic (for example: too little memory) ends the run right away.
-    let boot = qemu::boot(esp, machine, log, SUITE_TIMEOUT, echo, Some("PANIC: "))?;
-    if echo {
-        println!();
-    }
-    let mut problems = Vec::new();
+/// Lines printed by user processes (the kernel prefixes them with the name).
+fn from_user(line: &str) -> bool {
+    line.starts_with("[init]") || line.starts_with("[sandbox]") || line.starts_with("[probe")
+}
+
+/// Problems shared by every boot that runs the suite to the end.
+fn common_problems(boot: &qemu::Boot, problems: &mut Vec<String>) {
     if boot.timed_out {
         problems.push("timed out".to_string());
     }
@@ -57,6 +57,8 @@ fn suite(esp: &Path, machine: &Machine<'_>, log: &str, echo: bool) -> Result<Fac
         "KALKAN-TEST: PASS",
         "[kernel] audit: object graph consistent",
         "[kernel] system shut down cleanly",
+        // No debug trap may leak into the kernel (the single-step probes try).
+        " 0 kernel-mode debug traps",
         // Printed through buffers that cross / end at a page boundary.
         "[init] KALKAN-CROSS-PAGE-COPY-OK",
         "[sandbox] end-of-the-page!",
@@ -79,12 +81,38 @@ fn suite(esp: &Path, machine: &Machine<'_>, log: &str, echo: bool) -> Result<Fac
     }
     // Output of user processes is untrusted: the kernel must have neutralised
     // every escape sequence (the sandbox tries to inject one).
-    let injected = boot.raw.iter().any(|l| {
-        let user = l.starts_with("[init]") || l.starts_with("[sandbox]") || l.starts_with("[probe");
-        user && l.contains('\x1b')
-    });
+    let injected = boot.raw.iter().any(|l| from_user(l) && l.contains('\x1b'));
     if injected || !boot.has("?[2J?[31mFAKE KERNEL LOG?[0m") {
         problems.push("terminal escape sequences from a user process reached the console".into());
+    }
+}
+
+/// Runs the adversarial suite on a test kernel and verifies the complete log;
+/// `apic` is the local APIC mode the kernel must have chosen on this CPU.
+fn suite(esp: &Path, machine: &Machine<'_>, log: &str, echo: bool, apic: &str) -> Result<Facts> {
+    step(&format!(
+        "security suite on {} RAM, CPU `{}`",
+        machine.memory, machine.cpu
+    ));
+    // A bootloader panic (for example: too little memory) ends the run right away.
+    let boot = qemu::boot(esp, machine, log, SUITE_TIMEOUT, echo, Some("PANIC: "))?;
+    if echo {
+        println!();
+    }
+    let mut problems = Vec::new();
+    common_problems(&boot, &mut problems);
+    for required in [
+        "probe processes created (inactive); test kernel",
+        "on a test kernel...",
+        "--- process life cycle",
+        &format!("local APIC in {apic} mode"),
+    ] {
+        if !boot.has(required) {
+            problems.push(format!("missing log line: {required}"));
+        }
+    }
+    if boot.has("[SKIP]") {
+        problems.push("tests were skipped on a test kernel".into());
     }
     if !problems.is_empty() {
         return Err(format!(
@@ -95,6 +123,7 @@ fn suite(esp: &Path, machine: &Machine<'_>, log: &str, echo: bool) -> Result<Fac
 
     let tests = fact(&boot, "PASS - all ")?;
     let facts = Facts {
+        apic: fact(&boot, "local APIC in ")?,
         kernel_image: fact(&boot, "kernel image at ")?,
         direct_map: fact(&boot, "direct map at ")?,
         kernel_regions: boot
@@ -115,21 +144,96 @@ fn suite(esp: &Path, machine: &Machine<'_>, log: &str, echo: bool) -> Result<Fac
     };
     let audits = fact(&boot, "address spaces); ").unwrap_or_default();
     println!(
-        "    PASSED: {tests} security tests, {audits} kernel audits, kernel at {}",
-        facts.kernel_image
+        "    PASSED: {tests} security tests, {audits} kernel audits, kernel at {}, {} APIC",
+        facts.kernel_image, facts.apic
     );
     Ok(facts)
 }
 
+/// `true` if `line` contains a hexadecimal number long enough to be an address.
+fn shows_address(line: &str) -> bool {
+    line.match_indices("0x").any(|(at, _)| {
+        line[at + 2..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .count()
+            >= 8
+    })
+}
+
+/// A kernel built without the `selftest` feature: no probe processes, no test-only
+/// system calls, no addresses in its log — and the suite still passes everything
+/// that does not depend on the test facilities.
+fn production_kernel(esp: &Path) -> Result<()> {
+    step("production kernel: no test facilities, no addresses in the log");
+    let log = "kalkan-production.log";
+    let boot = qemu::boot(
+        esp,
+        &Machine::default(),
+        log,
+        SUITE_TIMEOUT,
+        false,
+        Some("PANIC: "),
+    )?;
+    let mut problems = Vec::new();
+    common_problems(&boot, &mut problems);
+    for required in [
+        "'sandbox' and 0 probe processes created (inactive)",
+        "(not a test kernel)...",
+        "[PASS] no kernel statistics outside test kernels",
+        "[PASS] no kernel layout outside test kernels",
+        "[PASS] no probe processes outside test kernels",
+        "groups skipped: not a test kernel",
+        "kernel image at <hidden>",
+        "direct map at <hidden>",
+        "slide <hidden>",
+        "PML4 slots <hidden>",
+        "base <hidden>, entry <hidden>",
+    ] {
+        if !boot.has(required) {
+            problems.push(format!("missing log line: {required}"));
+        }
+    }
+    if boot.has("; test kernel") {
+        problems.push("the kernel calls itself a test kernel".into());
+    }
+    // Everything the kernel printed (firmware output before the banner aside).
+    let banner = boot
+        .log
+        .iter()
+        .position(|l| l.contains("Kalkan v"))
+        .unwrap_or(0);
+    if let Some(line) = boot.log[banner..]
+        .iter()
+        .find(|l| !from_user(l) && shows_address(l))
+    {
+        problems.push(format!("the kernel printed an address: {line}"));
+    }
+    if !problems.is_empty() {
+        return Err(format!(
+            "production kernel failed (see target/{log}): {}",
+            problems.join("; ")
+        ));
+    }
+    let tests = fact(&boot, "PASS - all ")?;
+    println!("    PASSED: {tests} security tests; probes and diagnostics absent, addresses hidden");
+    Ok(())
+}
+
 /// Different boots must not share their address space layout.
+///
+/// The first two runs must differ in *every* respect. Both machines have less
+/// than 1 GiB of RAM, so the kernel draws each placement from the same range
+/// on both: only randomness can make them differ. (The range of the direct map
+/// depends on the amount of RAM, so a comparison with the 5 GiB machine alone
+/// would prove nothing.)
 fn randomisation(runs: &[Facts]) -> Result<()> {
     step("address space layout randomisation across boots");
     let mut weak = Vec::new();
     let mut check = |what: &str, get: &dyn Fn(&Facts) -> &str| {
         let values: Vec<&str> = runs.iter().map(get).collect();
-        let distinct = values.iter().filter(|v| **v != values[0]).count() + 1;
         println!("    {what:<28} {}", values.join("  "));
-        if distinct < 2 {
+        if values.len() < 2 || values[0] == values[1] {
             weak.push(what.to_string());
         }
     };
@@ -312,6 +416,15 @@ fn boot_chain_tampering(esp: &Path, quick: bool) -> Result<()> {
     if boot.has("Kalkan v") || boot.has("[boot]") {
         return Err("a modified kernel was started by the bootloader (see target/kalkan-tampered-kernel.log)".into());
     }
+    // The bootloader stops at its error screen: QEMU must still be running. An
+    // early exit (a crash, a configuration error) would prove nothing.
+    if !boot.timed_out || boot.exit.is_some() {
+        return Err(format!(
+            "the boot with a modified kernel ended unexpectedly (exit {:?}; see \
+             target/kalkan-tampered-kernel.log)",
+            boot.exit
+        ));
+    }
     println!("    PASSED: one byte of the kernel flipped: never started by the bootloader");
     Ok(())
 }
@@ -334,29 +447,39 @@ fn fail_closed_cpu_checks(esp: &Path) -> Result<()> {
 }
 
 /// Runs every scenario. With `quick`, only the suite on the default machine and
-/// one tamper test are run.
-pub fn run(esp: &Path, quick: bool) -> Result<()> {
-    let default = suite(esp, &Machine::default(), "kalkan-test.log", true)?;
+/// one tamper test are run. `esp` holds a test kernel, `production` (not needed
+/// with `quick`) a normal one.
+pub fn run(esp: &Path, production: Option<&Path>, quick: bool) -> Result<()> {
+    // The local APIC is programmed through MSRs (x2APIC) when the CPU supports it
+    // and through MMIO (xAPIC) otherwise: both paths are exercised.
+    let x2apic = Machine {
+        cpu: "max,+x2apic",
+        ..Machine::default()
+    };
+    let default = suite(esp, &x2apic, "kalkan-test.log", true, "x2APIC")?;
     if !quick {
         let small = suite(
             esp,
             &Machine {
                 memory: "128M",
-                ..Machine::default()
+                cpu: "max,-x2apic",
             },
             "kalkan-test-128M.log",
             false,
+            "xAPIC",
         )?;
         let large = suite(
             esp,
             &Machine {
                 memory: "5G",
-                ..Machine::default()
+                ..x2apic
             },
             "kalkan-test-5G.log",
             false,
+            "x2APIC",
         )?;
         randomisation(&[default, small, large])?;
+        production_kernel(production.ok_or("no production kernel was built")?)?;
         fail_closed_cpu_checks(esp)?;
     }
     boot_chain_tampering(esp, quick)?;

@@ -33,15 +33,15 @@
 
 | Goal | Mechanism |
 |---|---|
-| No authority without a capability | Per-process CSpaces; no global names; every system call looks up a capability with an explicit required right |
+| No authority without a capability | Per-process CSpaces; no global names; every system call looks up a capability with an explicit required right — even randomness (an entropy capability) and terminating other threads (a thread capability) |
 | Authority can only shrink | `Rights::derive` subset rule (exhaustively tested), write-once badges, GRANT for cross-domain transfer |
 | Authority can be withdrawn | Derivation tree, transitive revocation across CSpaces, revocation also removes frame mappings |
 | No confused-deputy via pointers | User memory is accessed only after a page-table walk of the *caller's* address space with user-permission checks; kernel addresses can never be named |
 | Memory isolation | Separate address spaces, supervisor-only kernel half, SMEP/SMAP, NX, W^X, zeroed frames |
-| Kernel integrity | Rust memory safety, `unsafe` confined and documented, W^X kernel image, write-protect (CR0.WP), guard pages, IST stacks (incl. `#DB`), hardened heap, overflow checks, fail-closed panics, a self-audit of the whole object graph |
+| Kernel integrity | Rust memory safety, `unsafe` confined and documented, W^X kernel image, write-protect (CR0.WP), guard pages, IST stacks (incl. `#DB`), hardened heap, overflow checks, fail-closed panics, a self-audit of the whole object graph (page tables checked in both directions) |
 | Register / microarchitectural state | GPRs scrubbed on entry and restored only from saved user state; SIMD disabled; `lfence` after `swapgs`; IBPB on address-space switch; VERW on return; Spectre-v1 index clamping; `rdtsc` privileged |
-| Address secrecy | KASLR; the kernel relocates its direct map of physical memory to a random address; randomised stack, heap and MMIO regions; user ASLR; UMIP |
-| Availability | Kernel never blocks; every user-triggerable error returns an error code; untyped budgets (revocable together with everything built from them); per-address-space page-table quota with reclamation of empty tables; a kernel frame reserve that user activity can never consume; hard limits on all kernel tables; supervised threads report their exit to their supervisor |
+| Address secrecy | KASLR; the kernel relocates its direct map of physical memory to a random address; randomised stack, heap and MMIO regions; user ASLR; UMIP; no addresses in the kernel log |
+| Availability | Kernel never blocks; every user-triggerable error returns an error code; untyped budgets (revocable together with everything built from them); per-address-space page-table quota with reclamation of empty tables; a kernel frame reserve that user activity can never consume; hard limits on all kernel tables, sized so that no process can exhaust them for the others; supervised threads report their exit to their supervisor; a dead thread releases its memory at once, even if its report is never collected; calls that can no longer be answered return `EDEAD`; supervisors can kill the threads they hold capabilities to |
 | Boot integrity | Pinned bootloader (tag, commit, digest); BLAKE2b-512 of kernel and modules checked by Limine; module digests compiled into the kernel and re-checked; tamper test in CI |
 | Supply chain | No third-party crates in the kernel; `cargo-deny`; CI actions pinned to commit SHAs; minimal workflow permissions |
 
@@ -80,8 +80,22 @@ vulnerabilities, but contributions are very welcome.
 * **Error codes check rights before type.** A capability of the wrong type that
   also lacks the required right yields `EPERM`, not `ETYPE`. Both are refusals;
   the caller learns nothing it cannot read with `cap_info` on its own slot.
-* **Tested on an emulated CPU.** The suite runs under QEMU's TCG. Mitigations for
-  hardware side channels (IBRS, STIBP, IBPB, VERW) are enabled when the CPU offers
-  them but their effect is not measured.
+* **Never run on real hardware yet.** The suite runs under QEMU's TCG, which does
+  not implement IBRS/STIBP (`spec-ctrl`): that code path has never executed.
+  Mitigations for hardware side channels (IBRS, STIBP, IBPB, VERW) are enabled
+  when the CPU offers them, but their effect is not measured. Both local APIC
+  modes (x2APIC and xAPIC) are exercised.
+* **No process creation from user space.** All processes are created by the
+  kernel at boot from verified modules; there is no `spawn` system call yet. A
+  supervisor can stop processes (`thread_kill`) but not start new ones.
+* **Test kernels are for testing only.** A kernel built with the `selftest`
+  feature reveals its layout (`kernel_layout`, addresses in the log) and creates
+  probe processes. `cargo xtask build` never enables it; CI checks that a normal
+  kernel has none of these.
+* **Debug traps from user mode are handled on an IST stack.** A `#DB` raised by a
+  user process (trap flag, `icebp`) runs the kernel's trap path on its dedicated
+  16 KiB stack rather than the 64 KiB kernel stack. That path is short and no
+  debug trap ever reaches kernel mode (the suite counts them), but moving such
+  traps to the kernel stack, as Linux does, would be more robust.
 * **Not formally verified.** The capability model is tested against a reference
   model and fuzzed, not proven.

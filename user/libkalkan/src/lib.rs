@@ -209,9 +209,19 @@ pub fn yield_now() {
     sys(abi::sys::YIELD, [0; 6]);
 }
 
-/// Returns 64 bits from the kernel CSPRNG.
-pub fn random() -> u64 {
-    sys(abi::sys::RANDOM, [0; 6]).rdi
+/// Returns 64 bits from the kernel CSPRNG (requires `READ` on an entropy
+/// capability).
+pub fn random(entropy: u64) -> Result<u64> {
+    let r = sys(abi::sys::RANDOM, [entropy, 0, 0, 0, 0, 0]);
+    r.status()?;
+    Ok(r.rdi)
+}
+
+/// Terminates a thread and releases everything it owns (requires `WRITE` on the
+/// thread capability). Its supervisor receives no report. Does not return if
+/// `thread` is the caller itself.
+pub fn thread_kill(thread: u64) -> Result<()> {
+    sys(abi::sys::THREAD_KILL, [thread, 0, 0, 0, 0, 0]).status()
 }
 
 /// Aggregate kernel resource usage (see [`kernel_stats`]).
@@ -232,6 +242,8 @@ pub struct KernelStats {
 }
 
 /// Reads the kernel's resource statistics (requires `READ` on the console cap).
+///
+/// Test kernels only; other kernels return [`Error::NoSys`].
 pub fn kernel_stats(console: u64) -> Result<KernelStats> {
     let r = sys(abi::sys::KERNEL_STATS, [console, 0, 0, 0, 0, 0]);
     r.status()?;
@@ -242,6 +254,39 @@ pub fn kernel_stats(console: u64) -> Result<KernelStats> {
         threads: r.r10,
         frames: r.r8,
         endpoints: r.r9,
+    })
+}
+
+/// Addresses of live kernel memory (see [`kernel_layout`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelLayout {
+    /// Start of the kernel's code.
+    pub text: u64,
+    /// Start of the kernel's writable data.
+    pub data: u64,
+    /// The kernel image as seen through the direct map of physical memory.
+    pub direct_map: u64,
+    /// A word on the kernel stack.
+    pub stack: u64,
+    /// A live kernel heap object.
+    pub heap: u64,
+}
+
+/// Reads the addresses of live kernel memory, so that the self-test suite can aim
+/// its attacks at the real kernel despite KASLR (requires `READ` on the console
+/// cap).
+///
+/// Test kernels only; other kernels return [`Error::NoSys`] and never reveal
+/// their layout.
+pub fn kernel_layout(console: u64) -> Result<KernelLayout> {
+    let r = sys(abi::sys::KERNEL_LAYOUT, [console, 0, 0, 0, 0, 0]);
+    r.status()?;
+    Ok(KernelLayout {
+        text: r.rdi,
+        data: r.rsi,
+        direct_map: r.rdx,
+        stack: r.r10,
+        heap: r.r8,
     })
 }
 

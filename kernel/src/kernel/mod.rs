@@ -17,8 +17,8 @@ pub mod loader;
 pub mod object;
 mod syscall;
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -31,15 +31,20 @@ use kcore::rights::Rights;
 use self::object::*;
 use crate::arch::entry::{SPURIOUS_VECTOR, SYSCALL_VECTOR, TIMER_VECTOR, TrapFrame};
 use crate::arch::{self, apic};
+use crate::log::Addr;
 use crate::sync::SpinLock;
 use crate::{kprintln, mm};
 
 /// Hard limits that bound kernel memory consumption regardless of user behaviour.
 pub mod limits {
-    pub const MAX_CAPS: usize = 4096;
+    /// Room for every capability space to be full at once: a process that fills
+    /// its own space cannot exhaust the capability table for everybody else.
+    pub const MAX_CAPS: usize = MAX_CSPACES * kcore::abi::CSPACE_SLOTS;
     pub const MAX_CSPACES: usize = 64;
     pub const MAX_THREADS: usize = 64;
-    pub const MAX_ENDPOINTS: usize = 256;
+    /// Room for every endpoint the root budget can pay for: holders of budgets
+    /// cannot exhaust the endpoint table for each other.
+    pub const MAX_ENDPOINTS: usize = (ROOT_UNTYPED_BYTES / kcore::abi::cost::ENDPOINT) as usize;
     pub const MAX_VSPACES: usize = 64;
     pub const MAX_FRAMES: usize = 8192;
     pub const MAX_UNTYPED: usize = 16;
@@ -57,6 +62,21 @@ pub struct Stats {
     pub context_switches: u64,
     pub ipc_messages: u64,
     pub audits: u64,
+}
+
+/// Addresses of live kernel memory. A test kernel hands them to the self-test
+/// suite (`kernel_layout`) so that its attacks hit the real kernel despite KASLR;
+/// other kernels never reveal them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Landmarks {
+    /// Start of the kernel's code.
+    pub text: u64,
+    /// Start of the kernel's writable data.
+    pub data: u64,
+    /// The kernel image as seen through the direct map of physical memory.
+    pub direct_map: u64,
+    /// A word on the kernel stack.
+    pub stack: u64,
 }
 
 /// What to do after handling a trap.
@@ -79,6 +99,11 @@ pub struct Kernel {
     need_resched: bool,
     pub(crate) rng: ChaChaRng,
     pub(crate) stats: Stats,
+    /// Self-test only: kernel addresses and a live heap object to aim at.
+    #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
+    pub(crate) landmarks: Landmarks,
+    #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
+    pub(crate) heap_canary: Option<Box<[u64; 4]>>,
 }
 
 static KERNEL: SpinLock<Option<Kernel>> = SpinLock::new(None);
@@ -98,6 +123,8 @@ impl Kernel {
             need_resched: false,
             rng,
             stats: Stats::default(),
+            landmarks: Landmarks::default(),
+            heap_canary: None,
         }
     }
 
@@ -126,7 +153,7 @@ impl Kernel {
                     e.refs += 1;
                 }
             }
-            Object::Thread(_) | Object::Console => {}
+            Object::Thread(_) | Object::Console | Object::Entropy => {}
         }
     }
 
@@ -157,11 +184,25 @@ impl Kernel {
                 if let Some(e) = self.endpoints.get_mut(id) {
                     e.refs -= 1;
                     if e.refs == 0 {
-                        self.destroy_endpoint(id);
+                        if e.handlers == 0 {
+                            self.destroy_endpoint(id);
+                        } else {
+                            self.orphan_endpoint(id);
+                        }
                     }
                 }
             }
-            Object::Thread(_) | Object::Console => {}
+            Object::Thread(_) | Object::Console | Object::Entropy => {}
+        }
+    }
+
+    /// A thread stops reporting its faults to `ep`.
+    fn drop_handler(&mut self, ep: EndpointId) {
+        if let Some(e) = self.endpoints.get_mut(ep) {
+            e.handlers -= 1;
+            if e.handlers == 0 && e.refs == 0 {
+                self.destroy_endpoint(ep);
+            }
         }
     }
 
@@ -187,23 +228,40 @@ impl Kernel {
         let Some(ep) = self.endpoints.remove(id) else {
             return;
         };
-        // Every thread still waiting on the endpoint is woken with EDEAD.
-        for t in ep.senders.into_iter().chain(ep.receivers) {
+        self.refund(ep.charge);
+        self.wake_waiters(id, ep.senders.into_iter().chain(ep.receivers).collect());
+    }
+
+    /// The last capability to an endpoint is gone while some threads still name it
+    /// as their fault endpoint. Nobody can ever receive from it again, so every
+    /// waiting thread is released now, and later reports to it are dropped
+    /// ([`Kernel::report_death`]) instead of waiting forever.
+    fn orphan_endpoint(&mut self, id: EndpointId) {
+        let Some(e) = self.endpoints.get_mut(id) else {
+            return;
+        };
+        let waiting: Vec<ThreadId> = e.senders.drain(..).chain(e.receivers.drain(..)).collect();
+        self.wake_waiters(id, waiting);
+    }
+
+    /// Wakes the threads that were waiting on endpoint `id` with `EDEAD`; a dead
+    /// thread that was waiting to deliver its final report is removed.
+    fn wake_waiters(&mut self, id: EndpointId, waiting: Vec<ThreadId>) {
+        for t in waiting {
             // Only threads that really are blocked on this endpoint are touched.
-            let blocked = self.threads.get(t).is_some_and(|th| {
-                matches!(th.state, ThreadState::BlockedSend(e) | ThreadState::BlockedRecv(e) if e == id)
-            });
-            if !blocked {
+            let Some(th) = self.threads.get(t) else {
+                continue;
+            };
+            if !matches!(th.state, ThreadState::BlockedSend(e) | ThreadState::BlockedRecv(e) if e == id)
+            {
                 continue;
             }
-            let fault = self.threads.get(t).is_some_and(|th| th.outgoing.fault);
-            if fault {
+            if th.zombie {
                 self.finish_thread(t);
             } else {
                 self.complete(t, Err(abi::Error::Dead));
             }
         }
-        self.refund(ep.charge);
     }
 
     /// Removes a frame mapping created through a frame capability.
@@ -254,23 +312,23 @@ impl Kernel {
         }
     }
 
-    /// Terminates a thread and releases everything it owns.
-    pub(crate) fn finish_thread(&mut self, t: ThreadId) {
-        let Some(th) = self.threads.remove(t) else {
+    /// Releases everything a terminating thread owns — its capability space, its
+    /// address space, and the caller waiting for its reply — but keeps the thread
+    /// record, which may still have to deliver a final report to its supervisor.
+    ///
+    /// Called the moment a thread dies, so its memory comes back at once even if
+    /// nobody ever collects the report (no zombie can pin memory).
+    pub(crate) fn release_resources(&mut self, t: ThreadId) {
+        let Some(th) = self.threads.get_mut(t) else {
             return;
         };
-        // Unlink from any endpoint queue it may still be in.
-        match th.state {
-            ThreadState::BlockedSend(ep) | ThreadState::BlockedRecv(ep) => {
-                if let Some(e) = self.endpoints.get_mut(ep) {
-                    e.senders.retain(|x| *x != t);
-                    e.receivers.retain(|x| *x != t);
-                }
-            }
-            _ => {}
+        if th.zombie {
+            return;
         }
+        th.zombie = true;
+        let (cspace, vspace, reply_to) = (th.cspace, th.vspace, th.reply_to.take());
         // A caller waiting for this thread's reply must not wait forever.
-        if let Some(caller) = th.reply_to
+        if let Some(caller) = reply_to
             && self
                 .threads
                 .get(caller)
@@ -278,16 +336,61 @@ impl Kernel {
         {
             self.complete(caller, Err(abi::Error::Dead));
         }
-        if let Ok(removed) = self.caps.destroy_space(th.cspace) {
+        if let Ok(removed) = self.caps.destroy_space(cspace) {
             for cap in removed {
                 self.on_cap_removed(cap);
             }
         }
-        if let Some((ep, _)) = th.fault_ep {
-            self.release(Object::Endpoint(ep));
-        }
-        self.release_vspace(th.vspace);
+        self.release_vspace(vspace);
         self.run_queue.retain(|x| *x != t);
+    }
+
+    /// Terminates a thread and removes it.
+    pub(crate) fn finish_thread(&mut self, t: ThreadId) {
+        self.release_resources(t);
+        let Some(th) = self.threads.remove(t) else {
+            return;
+        };
+        // Unlink from any endpoint queue it may still be in.
+        if let ThreadState::BlockedSend(ep) | ThreadState::BlockedRecv(ep) = th.state
+            && let Some(e) = self.endpoints.get_mut(ep)
+        {
+            e.senders.retain(|x| *x != t);
+            e.receivers.retain(|x| *x != t);
+        }
+        if let Some((ep, _)) = th.fault_ep {
+            self.drop_handler(ep);
+        }
+        self.run_queue.retain(|x| *x != t);
+    }
+
+    /// Sends the final report of a dying thread to its supervisor, or removes the
+    /// thread right away if nobody can receive it. Its resources are released
+    /// first, whether or not the report is ever collected.
+    pub(crate) fn report_death(&mut self, t: ThreadId, words: [u64; 4]) {
+        self.release_resources(t);
+        // Checked after the release: dropping the thread's own capabilities may
+        // have orphaned its fault endpoint.
+        let target = self
+            .threads
+            .get(t)
+            .and_then(|th| th.fault_ep)
+            .filter(|&(ep, _)| {
+                Some(t) != self.root && self.endpoints.get(ep).is_some_and(|e| e.refs > 0)
+            });
+        match target {
+            Some((ep, badge)) => {
+                let msg = Outgoing {
+                    badge,
+                    words,
+                    cap_slot: None,
+                    call: false,
+                    fault: true,
+                };
+                self.ipc_send(t, ep, msg);
+            }
+            None => self.finish_thread(t),
+        }
     }
 
     fn name(&self, t: ThreadId) -> &str {
@@ -297,9 +400,8 @@ impl Kernel {
     /// Handles a CPU exception raised by user code.
     fn fault(&mut self, t: ThreadId, vector: u64, error: u64, addr: u64) {
         self.stats.faults += 1;
-        let (rip, fault_ep) = match self.threads.get(t) {
-            Some(th) => (th.ctx.rip, th.fault_ep),
-            None => return,
+        let Some(rip) = self.threads.get(t).map(|th| th.ctx.rip) else {
+            return;
         };
         let what = match vector {
             0 => "divide error",
@@ -310,32 +412,18 @@ impl Kernel {
             _ => "exception",
         };
         kprintln!(
-            "[fault] thread '{}' killed: {} (vector {}) at rip={:#x} addr={:#x} err={:#x}",
+            "[fault] thread '{}' killed: {} (vector {}) at rip={} addr={} err={:#x}",
             self.name(t),
             what,
             vector,
-            rip,
-            addr,
+            Addr(rip),
+            Addr(addr),
             error
         );
         if Some(t) == self.root {
             kprintln!("[fault] the root task faulted");
-            self.finish_thread(t);
-            return;
         }
-        match fault_ep {
-            Some((ep, badge)) if self.endpoints.contains(ep) => {
-                let msg = Outgoing {
-                    badge,
-                    words: [vector, error, addr, rip],
-                    cap_slot: None,
-                    call: false,
-                    fault: true,
-                };
-                self.ipc_send(t, ep, msg);
-            }
-            _ => self.finish_thread(t),
-        }
+        self.report_death(t, [vector, error, addr, rip]);
     }
 
     // --------------------------------------------------------------- scheduling
@@ -441,13 +529,14 @@ impl Kernel {
         let (free, total) = mm::frame::stats();
         kprintln!(
             "[kernel] stats: {} syscalls ({} denied), {} IPC messages, {} faults contained, \
-             {} preemptions, {} context switches",
+             {} preemptions, {} context switches, {} kernel-mode debug traps",
             s.syscalls,
             s.denied,
             s.ipc_messages,
             s.faults,
             s.preemptions,
-            s.context_switches
+            s.context_switches,
+            arch::entry::kernel_debug_traps()
         );
         kprintln!(
             "[kernel] memory: {} / {} frames free, heap {} bytes, {} live capabilities",
@@ -460,14 +549,17 @@ impl Kernel {
             Ok(c) => {
                 kprintln!(
                     "[kernel] audit: object graph consistent ({} capabilities, {} threads, \
-                     {} endpoints, {} frames, {} mappings, {} address spaces); {} audits passed",
+                     {} endpoints, {} frames, {} mappings, {} page tables, {} address spaces); \
+                     {} audits passed, {} with a full page-table walk",
                     c.capabilities,
                     c.threads,
                     c.endpoints,
                     c.frames,
                     c.mappings,
+                    c.page_tables,
                     c.vspaces,
-                    s.audits + 1
+                    s.audits + 1,
+                    s.audits / audit::PAGE_WALK_INTERVAL + 1
                 );
                 true
             }
@@ -500,8 +592,13 @@ pub fn user_trap(frame: &mut TrapFrame) {
 }
 
 /// Boot-time construction of the initial processes.
-pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])]) {
+pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])], landmarks: Landmarks) {
     let mut k = Kernel::new(rng);
+    if cfg!(feature = "selftest") {
+        k.landmarks = landmarks;
+        // A live heap object for the "read kernel heap memory" attack.
+        k.heap_canary = Some(Box::new([0x6b61_6c6b_616e_6361; 4]));
+    }
     let image = |name: &str| {
         modules
             .iter()
@@ -512,13 +609,13 @@ pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])]) {
 
     let describe = |name: &str, p: &loader::Spawned| {
         kprintln!(
-            "[loader] '{}': {} segments, {} relocations, base {:#x}, entry {:#x}, stack top {:#x}",
+            "[loader] '{}': {} segments, {} relocations, base {}, entry {}, stack top {}",
             name,
             p.segments,
             p.relocations,
-            p.base,
-            p.entry,
-            p.stack_top
+            Addr(p.base),
+            Addr(p.entry),
+            Addr(p.stack_top)
         );
     };
     let init = loader::spawn(&mut k, "init", image("init")).expect("failed to load init");
@@ -526,11 +623,17 @@ pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])]) {
     let sandbox =
         loader::spawn(&mut k, "sandbox", image("sandbox")).expect("failed to load sandbox");
     describe("sandbox", &sandbox);
-    // Probe processes: further instances of the (untrusted) sandbox image, each
-    // with its own address space, capability space and ASLR layout.
-    let probes: Vec<loader::Spawned> = (0..abi::PROBE_COUNT)
+    // Test kernels only: probe processes, further instances of the (untrusted)
+    // sandbox image, each with its own address space, capability space and ASLR
+    // layout. The self-test suite starts one per attack.
+    let probe_count = if cfg!(feature = "selftest") {
+        abi::PROBE_COUNT
+    } else {
+        0
+    };
+    let probes: Vec<loader::Spawned> = (0..probe_count)
         .map(|i| {
-            loader::spawn(&mut k, &format!("probe{i:02}"), image("sandbox"))
+            loader::spawn(&mut k, &alloc::format!("probe{i:02}"), image("sandbox"))
                 .expect("failed to load a probe process")
         })
         .collect();
@@ -567,6 +670,11 @@ pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])]) {
             abi::slot::SANDBOX_VSPACE,
             Object::VSpace(sandbox.vspace),
             Rights::ALL
+        ),
+        (
+            abi::slot::ENTROPY,
+            Object::Entropy,
+            Rights::READ.union(Rights::GRANT)
         ),
     ];
     for (i, p) in probes.iter().enumerate() {
@@ -606,9 +714,14 @@ pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])]) {
         .expect("initial kernel state is inconsistent");
     kprintln!(
         "[kernel] root task 'init' ready with {} initial capabilities; 'sandbox' and {} probe \
-         processes created (inactive)",
+         processes created (inactive){}",
         initial.len(),
-        probes.len()
+        probes.len(),
+        if cfg!(feature = "selftest") {
+            "; test kernel"
+        } else {
+            ""
+        }
     );
     *KERNEL.lock() = Some(k);
 }

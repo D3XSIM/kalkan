@@ -122,7 +122,10 @@ fn map_fresh(pml4: u64, base: u64, pages: u64) {
 }
 
 /// Builds the kernel page tables. Does **not** activate them.
-pub fn build(map: &MemoryMap, lapic_phys: u64, rng: &mut ChaChaRng) -> Layout {
+///
+/// `lapic_phys` is the local APIC's register page; it is mapped only when the
+/// APIC will be used in xAPIC (MMIO) mode.
+pub fn build(map: &MemoryMap, lapic_phys: Option<u64>, rng: &mut ChaChaRng) -> Layout {
     let boot_pml4 = arch::read_cr3();
     let pml4 = frame::alloc().expect("out of memory for kernel PML4");
     let mut layout = Layout {
@@ -248,16 +251,18 @@ pub fn build(map: &MemoryMap, lapic_phys: u64, rng: &mut ChaChaRng) -> Layout {
     let pdpt = frame::alloc().expect("out of memory for heap tables");
     paging::set_pml4_entry(pml4, slots[1], pdpt | PRESENT | WRITABLE);
 
-    // 6. Local APIC registers, uncached.
-    layout.lapic_virt = slot_base(slots[2]) + rng.below(1 << 20) * PAGE_SIZE;
-    map_kernel(
-        pml4,
-        layout.lapic_virt,
-        lapic_phys,
-        WRITABLE | NO_EXECUTE | NO_CACHE | WRITE_THROUGH,
-        PageSize::Size4K,
-    )
-    .expect("map local APIC");
+    // 6. Local APIC registers, uncached (xAPIC mode only).
+    if let Some(lapic_phys) = lapic_phys {
+        layout.lapic_virt = slot_base(slots[2]) + rng.below(1 << 20) * PAGE_SIZE;
+        map_kernel(
+            pml4,
+            layout.lapic_virt,
+            lapic_phys,
+            WRITABLE | NO_EXECUTE | NO_CACHE | WRITE_THROUGH,
+            PageSize::Size4K,
+        )
+        .expect("map local APIC");
+    }
 
     KERNEL_PML4.store(pml4, Ordering::Relaxed);
     DIRECT_MAP.store(layout.direct_map, Ordering::Relaxed);

@@ -42,6 +42,8 @@ pub enum Object {
     Endpoint(EndpointId),
     /// The kernel debug console.
     Console,
+    /// The kernel's random number generator.
+    Entropy,
 }
 
 impl CapObject for Object {
@@ -65,6 +67,7 @@ impl Object {
             Self::Thread(_) => abi::obj::THREAD,
             Self::Endpoint(_) => abi::obj::ENDPOINT,
             Self::Console => abi::obj::CONSOLE,
+            Self::Entropy => abi::obj::ENTROPY,
         }
     }
 }
@@ -105,7 +108,12 @@ pub struct Frame {
 pub struct Endpoint {
     pub senders: VecDeque<ThreadId>,
     pub receivers: VecDeque<ThreadId>,
+    /// Capabilities to the endpoint.
     pub refs: u32,
+    /// Threads that report their faults here (`thread_set_fault_ep`). They keep
+    /// the endpoint alive but cannot receive from it: once the last capability is
+    /// gone the endpoint is *orphaned* and nothing ever waits on it again.
+    pub handlers: u32,
     pub charge: Charge,
 }
 
@@ -164,4 +172,7 @@ pub struct Thread {
     pub reply_to: Option<ThreadId>,
     pub outgoing: Outgoing,
     pub recv_slot: Option<u64>,
+    /// The thread has terminated and already released its capability space and
+    /// address space; only its final report to its supervisor is still queued.
+    pub zombie: bool,
 }

@@ -68,19 +68,19 @@ Boot module integrity (BLAKE2b-512):
 | 🧪 **Policy you can test** | All access-control decisions live in [`kcore`](kcore/src/lib.rs): `#![forbid(unsafe_code)]`, zero dependencies, unit-tested and property-tested on the host, fuzzed in CI. |
 | 🧱 **Hardware hardening, verified at boot** | NX, SMEP, SMAP (never lifted), UMIP, CR0.WP, CR4.TSD, no user SIMD, W^X everywhere, non-executable physmap, guard pages, KASLR — and the kernel *checks* each one by inspecting its own control registers and page tables. Fail-closed if a mandatory protection is missing. |
 | 🔗 **Verified boot chain** | Pinned bootloader (tag + commit + BLAKE2b). The bootloader verifies kernel and modules; the kernel verifies modules **again** against digests compiled into it. Tampering is tested in CI. |
-| ⚔️ **Adversarial test suite** | 120 boot-time security checks: a sandbox with 62 escape attempts, **47 probe processes** that each try one hardware-level attack (kernel memory, W^X, privileged instructions, ring-0 returns, hostile stack/flags, ...), and a **system call fuzzer** — run on three machine sizes, plus fail-closed and boot-tampering scenarios. |
-| 🔍 **The kernel audits itself** | A built-in auditor recomputes every reference count, mapping counter, budget, queue and page-table entry from first principles. In test builds it runs after *every* trap — about 44 000 times per boot. |
+| ⚔️ **Adversarial test suite** | 143 boot-time security checks: a sandbox with 67 escape attempts, **54 probe processes** that each try one hardware-level attack (kernel code, data, stack, heap and physmap **at their real, randomised addresses**, W^X, privileged instructions, ring-0 returns, hostile stack/flags, ...), **6 process life-cycle tests** and a **system call fuzzer** — run on three machine sizes and in both local APIC modes, plus a production-kernel check and fail-closed and boot-tampering scenarios. |
+| 🔍 **The kernel audits itself** | A built-in auditor recomputes every reference count, mapping counter, budget, queue, reply obligation and page-table entry from first principles, and walks every user page table to account for each present page. In test builds it runs after *every* trap — about 45 000 times per boot. |
 | 📦 **Zero-dependency kernel** | No third-party crates in the kernel or its policy core; the supply chain is the Rust toolchain and one pinned bootloader binary. |
 
 ### By the numbers
 
 | Component | Lines of Rust* | `unsafe` |
 |---|---:|---|
-| `kcore` — policy core | ~2 800 (more than half of it tests) | **forbidden** |
-| `kernel/src/kernel` — objects, IPC, syscalls, loader, self-audit | ~1 550 | **denied** |
-| `kernel/src/arch` + `boot.rs` + `sync.rs` | ~1 200 | allowed, every block justified |
-| `kernel/src/mm` — memory management | ~1 000 | allowed, every block justified |
-| `user/` — root task, sandbox, probes, fuzzer | ~2 000 | attack code only |
+| `kcore` — policy core | ~2 900 (more than half of it tests) | **forbidden** |
+| `kernel/src/kernel` — objects, IPC, syscalls, loader, self-audit | ~1 800 | **denied** |
+| `kernel/src/arch` + `boot.rs` + `sync.rs` | ~1 250 | allowed, every block justified |
+| `kernel/src/mm` — memory management | ~1 050 | allowed, every block justified |
+| `user/` — root task, sandbox, probes, fuzzer | ~2 900 | attack code only |
 | Third-party crates in the kernel | 0 | — |
 
 <sub>*non-blank, non-comment lines</sub>
@@ -131,9 +131,9 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | ret2usr / user data abuse | SMEP + SMAP, never lifted (no `stac` in the kernel) | `kernel/src/arch/x86_64/cpu.rs` |
 | Code injection | W^X for kernel image, physmap, heap, stacks and user programs; W+X mappings are unrepresentable, and W^X holds per *frame* across aliases; the physmap alias of the kernel image is read-only | `kernel/src/mm/*`, `kcore/src/elf.rs` |
 | Malformed executables | Strict, panic-free ELF validator (fuzzed); no interpreter, TLS, text relocations or dynamic linking | `kcore/src/elf.rs` |
-| Address disclosure | KASLR; the kernel moves its direct map of physical memory to a random address; randomised kernel stack/heap/MMIO slots; user ASLR; UMIP — all checked across boots in CI | `kernel/src/mm/kspace.rs`, `kernel/src/kernel/loader.rs` |
+| Address disclosure | KASLR; the kernel moves its direct map of physical memory to a random address; randomised kernel stack/heap/MMIO slots; user ASLR; UMIP; no addresses in the kernel log — all checked in CI | `kernel/src/mm/kspace.rs`, `kernel/src/kernel/loader.rs`, `kernel/src/log.rs` |
 | Spectre v1 | Branch-free index clamping on syscall numbers and capability slots | `kcore/src/nospec.rs` |
-| Spectre v2 / MDS / SWAPGS | IBRS + STIBP always on, IBPB on address-space switch, VERW on return (when supported), `lfence` after `swapgs` | `kernel/src/arch/x86_64/` |
+| Spectre v2 / MDS / SWAPGS | IBRS + STIBP always on, IBPB on address-space switch, VERW on return (each when the CPU supports it; QEMU's emulated CPU lacks IBRS/STIBP), `lfence` after `swapgs` | `kernel/src/arch/x86_64/` |
 | Speculative gadgets via stale registers | All GPRs zeroed on kernel entry | `kernel/src/arch/x86_64/entry.rs` |
 | SYSRET privilege escalation (CVE-2012-0217) | Kernel always returns with `iretq`; RFLAGS/CS/SS sanitised | `kernel/src/arch/x86_64/entry.rs` |
 | Debug trap on the syscall entry path (cf. CVE-2018-8897) | TF masked on `syscall`; `#DB` runs on its own IST stack; debug registers cleared | `kernel/src/arch/x86_64/` |
@@ -143,7 +143,8 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Information leaks via memory reuse | Frames zeroed on allocation *and* free; heap blocks zeroed; bootloader memory zeroed on reclaim | `kernel/src/mm/frame.rs`, `kernel/src/mm/heap.rs` |
 | Heap corruption | Encoded (safe-linked) free lists, poisoning, double-free detection, guard pages — corruption panics | `kernel/src/mm/heap.rs` |
 | Kernel stack overflow | Guard pages + IST stacks for #DF/NMI/#MC/#DB | `kernel/src/mm/kspace.rs` |
-| Resource exhaustion | Untyped memory budgets with refunds and revocation; per-address-space page-table quota with reclamation; a frame reserve user space can never touch; hard limits on every kernel table | `kernel/src/kernel/mod.rs` |
+| Resource exhaustion | Untyped memory budgets with refunds and revocation; per-address-space page-table quota with reclamation; a frame reserve user space can never touch; hard limits on every kernel table, sized so that no process can exhaust them for the others | `kernel/src/kernel/mod.rs` |
+| Stuck or zombie processes | A dead process returns its memory at once, even if nobody collects its report; calls that can no longer be answered return `EDEAD`; supervisors can `thread_kill` | `kernel/src/kernel/mod.rs`, `kernel/src/kernel/ipc.rs` |
 | Integer overflow | `overflow-checks = true` in release builds; checked arithmetic on all untrusted input | `Cargo.toml` |
 | Terminal injection | User console output is sanitised (no ESC / control characters) | `kernel/src/log.rs` |
 | Boot-time tampering | Pinned bootloader; BLAKE2b verification by bootloader *and* kernel | `xtask/`, `kernel/src/main.rs` |
@@ -185,7 +186,7 @@ kernel/
 user/
   libkalkan/      system call library
   init/           root task and the adversarial test suite
-  sandbox/        the attacker: escape suite, 47 fault probes, system call fuzzer
+  sandbox/        the attacker: escape suite, 54 fault probes, life-cycle roles, fuzzer
 xtask/            build, run and test orchestration (cargo xtask)
 fuzz/             cargo-fuzz targets
 docs/             architecture, threat model, system calls, testing, building
@@ -199,7 +200,8 @@ docs/             architecture, threat model, system calls, testing, building
 | Stress | 1.9 million model steps, 2 million parser mutations | `cargo test -p kalkan-core --release -- --ignored` |
 | Fuzzing | libFuzzer targets for the ELF validator and the capability database | `cargo +nightly fuzz run elf` |
 | Static claims | No third-party packages, `unsafe` confined, no `stac`/`sysret`, CI pinned, docs match the ABI | `cargo xtask check` |
-| Whole system | 120 checks in QEMU with the kernel auditing itself after every trap; 128 MiB, 256 MiB and 5 GiB of RAM | `cargo xtask test` |
+| Whole system | 143 checks in QEMU with a test kernel auditing itself after every trap; 128 MiB, 256 MiB and 5 GiB of RAM; local APIC in x2APIC and xAPIC mode | `cargo xtask test` |
+| Production kernel | A kernel without the test facilities: no probe processes, no diagnostic system calls, no addresses in its log — and every test that does not need them passes | `cargo xtask test` |
 | Randomisation | Kernel image, direct map, kernel regions and user programs must move between boots | `cargo xtask test` |
 | Fail-closed | CPUs without NX, SMEP or SMAP must be refused | `cargo xtask test` |
 | Boot integrity | Flipped, swapped, truncated, extra and missing modules, and a modified kernel, must never reach user space | `cargo xtask test` |

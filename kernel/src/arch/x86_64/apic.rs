@@ -1,7 +1,9 @@
 //! Local APIC (timer for preemptive scheduling).
 //!
-//! Supports both xAPIC (MMIO, mapped uncached by `mm::kspace`) and x2APIC (MSR)
-//! modes; the mode chosen by the firmware is kept.
+//! The kernel switches the APIC to x2APIC mode (registers are MSRs, no MMIO
+//! mapping at all) whenever the CPU supports it, and falls back to xAPIC mode
+//! (MMIO, mapped uncached by `mm::kspace`) otherwise. `cargo xtask test` boots
+//! both variants.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -63,16 +65,23 @@ fn disable_legacy_pic() {
     }
 }
 
-/// Initialises the local APIC. `mmio_virt` is the kernel mapping of
-/// [`physical_base`] (ignored in x2APIC mode).
-pub fn init(mmio_virt: u64) {
+/// Initialises the local APIC: in x2APIC mode if `x2apic` (the CPU supports it),
+/// otherwise in xAPIC mode through `mmio_virt`, the kernel's uncached mapping of
+/// [`physical_base`].
+pub fn init(x2apic: bool, mmio_virt: u64) {
     disable_legacy_pic();
-    // SAFETY: IA32_APIC_BASE exists; we only set the global enable bit.
+    // SAFETY: IA32_APIC_BASE exists; only the enable bits change. The APIC is
+    // enabled before x2APIC mode is selected: going straight from "disabled" to
+    // x2APIC is an invalid transition (#GP).
     unsafe {
-        let base = msr::read(msr::IA32_APIC_BASE);
-        msr::write(msr::IA32_APIC_BASE, base | APIC_GLOBAL_ENABLE);
+        let base = msr::read(msr::IA32_APIC_BASE) | APIC_GLOBAL_ENABLE;
+        msr::write(msr::IA32_APIC_BASE, base);
+        if x2apic {
+            msr::write(msr::IA32_APIC_BASE, base | X2APIC_ENABLE);
+        }
     }
     if !x2apic_mode() {
+        assert!(mmio_virt != 0, "local APIC registers are not mapped");
         MMIO.store(mmio_virt, Ordering::Relaxed);
     }
     write(REG_TPR, 0);

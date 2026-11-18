@@ -38,16 +38,23 @@ sandbox'tan kaçmaya çalıştığı saldırgan bir test paketiyle gelir.
   sabitlenmiş önyükleyici. Önyükleyici çekirdeği ve modülleri doğrular; çekirdek
   modülleri içine gömülü özetlerle **bir kez daha** doğrular. Kurcalama CI'da test
   edilir.
-- ⚔️ **Saldırgan test paketi** — 120 açılış zamanı güvenlik kontrolü: 62 kaçış
+- ⚔️ **Saldırgan test paketi** — 143 açılış zamanı güvenlik kontrolü: 67 kaçış
   denemesi yapan bir sandbox, her biri tek bir donanım düzeyi saldırı deneyen
-  **47 sonda süreci** (çekirdek belleği, W^X, ayrıcalıklı komutlar, ring 0'a dönüş,
-  düşmanca yığın/bayraklar...) ve bir **sistem çağrısı fuzzer'ı**. Üç farklı bellek
-  boyutunda, ayrıca "korumasız işlemcide açılmama" ve önyükleme kurcalama
-  senaryolarıyla çalışır.
+  **54 sonda süreci** (çekirdeğin kodu, verisi, yığını, heap'i ve fiziksel bellek
+  haritası — **gerçek, rastgele adreslerinde** —, W^X, ayrıcalıklı komutlar, ring
+  0'a dönüş, düşmanca yığın/bayraklar...), **6 süreç yaşam döngüsü testi** ve bir
+  **sistem çağrısı fuzzer'ı**. Üç farklı bellek boyutunda ve iki APIC kipinde
+  (x2APIC/xAPIC), ayrıca üretim çekirdeği, "korumasız işlemcide açılmama" ve
+  önyükleme kurcalama senaryolarıyla çalışır.
 - 🔍 **Çekirdek kendini denetler** — Yerleşik denetçi tüm referans sayaçlarını,
-  eşleme sayaçlarını, bütçeleri, kuyrukları ve sayfa tablosu girdilerini sıfırdan
-  yeniden hesaplar. Test derlemelerinde **her** tuzaktan (trap) sonra çalışır:
-  açılış başına yaklaşık 44.000 kez.
+  eşleme sayaçlarını, bütçeleri, kuyrukları, yanıt borçlarını ve sayfa tablosu
+  girdilerini sıfırdan yeniden hesaplar; kullanıcı sayfa tablolarını da tek tek
+  gezip her sayfanın hesabını sorar. Test derlemelerinde **her** tuzaktan (trap)
+  sonra çalışır: açılış başına yaklaşık 45.000 kez.
+- 🧰 **Test çekirdeği ayrı** — Sonda süreçleri, tanı amaçlı sistem çağrıları ve
+  günlükte adres gösterimi yalnızca `selftest` özelliğiyle derlenen test
+  çekirdeklerinde vardır. Normal çekirdek hiçbir adresi günlüğe yazmaz (`<hidden>`);
+  CI bunu da ayrıca açıp doğrular.
 - 📦 **Sıfır bağımlılık** — Çekirdekte ve politika çekirdeğinde üçüncü taraf crate
   yok.
 
@@ -84,18 +91,20 @@ Ayrıntılar: [docs/BUILDING.md](docs/BUILDING.md).
 | ret2usr | SMEP + SMAP, hiç kaldırılmaz (çekirdekte `stac` yok) |
 | Kod enjeksiyonu | Çekirdek imajı, fiziksel harita, heap, yığınlar ve kullanıcı programlarında W^X; W^X takma adlar (alias) üzerinden de çerçeve başına korunur |
 | Bozuk/kötü niyetli çalıştırılabilir | Katı, panik üretmeyen, fuzz edilen ELF doğrulayıcı |
-| Adres sızıntısı | KASLR; çekirdek fiziksel bellek haritasını rastgele bir adrese taşır; rastgele çekirdek yığın/heap/MMIO yerleşimi; kullanıcı ASLR; UMIP — hepsi CI'da açılışlar arasında karşılaştırılır |
+| Adres sızıntısı | KASLR; çekirdek fiziksel bellek haritasını rastgele bir adrese taşır; rastgele çekirdek yığın/heap/MMIO yerleşimi; kullanıcı ASLR; UMIP; çekirdek günlüğünde adres yok — hepsi CI'da doğrulanır |
 | Spectre v1/v2, MDS, SWAPGS | Dalsız indeks kısıtlama, IBPB, VERW, `swapgs` sonrası `lfence`, girişte tüm yazmaçların sıfırlanması |
 | SYSRET açığı (CVE-2012-0217) | Çekirdek her zaman `iretq` ile döner |
 | SIMD durum sızıntısı (LazyFP) | Kullanıcıya x87/SSE/AVX kapalı |
 | Bellek yeniden kullanımıyla sızıntı | Çerçeveler ayırmada **ve** serbest bırakmada sıfırlanır |
 | Heap bozulması | Kodlanmış serbest listeler, zehirleme, çift serbest bırakma tespiti, koruma sayfaları |
-| Kaynak tüketme | Geri alınabilir untyped bellek bütçeleri, adres alanı başına sayfa tablosu kotası (boşalan tablolar geri alınır), kullanıcının dokunamadığı çekirdek bellek rezervi ve her çekirdek tablosunda sert sınırlar |
+| Kaynak tüketme | Geri alınabilir untyped bellek bütçeleri, adres alanı başına sayfa tablosu kotası (boşalan tablolar geri alınır), kullanıcının dokunamadığı çekirdek bellek rezervi ve her çekirdek tablosunda, hiçbir sürecin başkaları için tüketemeyeceği büyüklükte sert sınırlar |
+| Takılı kalan / zombi süreçler | Ölen süreç raporu hiç okunmasa bile belleğini hemen geri verir; artık yanıtlanamayacak çağrılar `EDEAD` ile döner; yöneticiler `thread_kill` ile süreç sonlandırabilir |
+| Varsayılan rastgelelik | Rastgele sayı da bir yetkidir: `random` için entropi capability'si gerekir |
 | Terminal enjeksiyonu | Kullanıcı konsol çıktısı temizlenir (ESC/kontrol karakteri yok) |
 | Açılışta kurcalama | Sabitlenmiş önyükleyici; BLAKE2b doğrulaması hem önyükleyicide hem çekirdekte |
 
-Henüz kapsanmayanlar (SMP, IOMMU, KPTI, ...) [tehdit modelinde](docs/THREAT_MODEL.md#known-limitations)
-açıkça listelenmiştir.
+Henüz kapsanmayanlar (SMP, IOMMU, KPTI, Secure Boot, gerçek donanımda test, ...)
+[tehdit modelinde](docs/THREAT_MODEL.md#known-limitations) açıkça listelenmiştir.
 
 ## Uyarı
 

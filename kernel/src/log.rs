@@ -16,6 +16,26 @@ impl Write for Serial {
 
 static LOG: SpinLock<()> = SpinLock::new(());
 
+/// An address in a kernel log line.
+///
+/// Test kernels (feature `selftest`) print it; every other kernel prints
+/// `<hidden>`. The console may be captured, shared or readable by others, and an
+/// address on it would give away the KASLR slide or the layout of an address
+/// space. (Panic messages still print addresses: the system halts right after,
+/// and the next boot is randomised afresh.)
+#[derive(Clone, Copy, Debug)]
+pub struct Addr(pub u64);
+
+impl fmt::Display for Addr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if cfg!(feature = "selftest") {
+            write!(f, "{:#x}", self.0)
+        } else {
+            f.write_str("<hidden>")
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     let _guard = LOG.lock();

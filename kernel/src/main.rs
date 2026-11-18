@@ -33,6 +33,7 @@ use kcore::chacha20::ChaChaRng;
 
 use crate::arch::cpu::{Features, Posture};
 use crate::arch::rng::Sources;
+use crate::log::Addr;
 use crate::mm::MemoryMap;
 use crate::mm::kspace::Layout;
 use crate::sync::SpinLock;
@@ -80,7 +81,11 @@ pub(crate) extern "C" fn boot_main() -> ! {
     let hhdm = boot::hhdm_offset().expect("no HHDM response from the bootloader");
     mm::set_hhdm(hhdm);
     if let Some((phys, virt)) = boot::kernel_address() {
-        kprintln!("[boot] kernel image at {virt:#x} (physical {phys:#x})");
+        kprintln!(
+            "[boot] kernel image at {} (physical {})",
+            Addr(virt),
+            Addr(phys)
+        );
     }
     // Boot modules are recorded as physical ranges: the bootloader's direct map
     // (and every pointer into it) disappears when the kernel installs its own.
@@ -114,9 +119,10 @@ pub(crate) extern "C" fn boot_main() -> ! {
         total / 256
     );
 
-    let layout = mm::kspace::build(&map, arch::apic::physical_base(), &mut rng);
-    arch::gdt::set_interrupt_stacks(layout.ist_tops);
-    arch::gdt::set_kernel_stack(layout.stack_top);
+    // In x2APIC mode the local APIC is programmed through MSRs: its MMIO page is
+    // then not mapped at all.
+    let lapic_mmio = (!features.x2apic).then(arch::apic::physical_base);
+    let layout = mm::kspace::build(&map, lapic_mmio, &mut rng);
 
     *BOOT.lock() = Some(BootState {
         map,
@@ -180,12 +186,16 @@ extern "C" fn stage2() -> ! {
         seed,
     } = BOOT.lock().take().expect("boot state");
 
+    // The guarded stacks exist only in the kernel's own page tables: the TSS may
+    // point at them only now (until here, the early stacks in the image are used).
+    arch::gdt::set_interrupt_stacks(layout.ist_tops);
+    arch::gdt::set_kernel_stack(layout.stack_top);
     mm::heap::init(layout.heap_base, &mut rng);
     arch::syscall::init(layout.stack_top);
-    arch::apic::init(layout.lapic_virt);
+    arch::apic::init(features.x2apic, layout.lapic_virt);
     kprintln!(
-        "[mm] kernel page tables active; direct map at {:#x}; local APIC in {} mode",
-        layout.direct_map,
+        "[mm] kernel page tables active; direct map at {}; local APIC in {} mode",
+        Addr(layout.direct_map),
         if arch::apic::is_x2apic() {
             "x2APIC"
         } else {
@@ -198,7 +208,13 @@ extern "C" fn stage2() -> ! {
 
     let modules = verified_modules(&modules);
     rng.reseed(&arch::rdtsc().to_le_bytes());
-    kernel::init(rng, &modules);
+    let landmarks = kernel::Landmarks {
+        text: layout.text.0,
+        data: layout.data.0,
+        direct_map: layout.direct_map + layout.kernel_phys,
+        stack: layout.stack_top - 8,
+    };
+    kernel::init(rng, &modules, landmarks);
 
     let reclaimed = mm::frame::reclaim_bootloader_memory(&map);
     kprintln!(

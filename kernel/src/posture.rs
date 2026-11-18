@@ -137,10 +137,14 @@ pub fn verify(
     let slide: alloc::string::String = if kaslr_slide == 0 {
         "DISABLED".into()
     } else {
-        alloc::format!("slide {kaslr_slide:#x}")
+        alloc::format!("slide {}", crate::log::Addr(kaslr_slide))
     };
     check("KASLR (kernel image)", kaslr_slide != 0, false, &slide);
-    let regions = alloc::format!("PML4 slots {:?}", layout.slots);
+    let regions = if cfg!(feature = "selftest") {
+        alloc::format!("PML4 slots {:?}", layout.slots)
+    } else {
+        "PML4 slots <hidden>".into()
+    };
     check(
         "Randomised stack/heap/MMIO placement",
         true,

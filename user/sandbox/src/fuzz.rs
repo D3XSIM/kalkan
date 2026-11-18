@@ -151,7 +151,9 @@ pub fn run(seed: u64) -> ! {
         let status = unsafe { k::syscall(nr, a) }.rax;
         match status {
             0 => successes += 1,
-            e if e < errors.len() as u64 => errors[e as usize] += 1,
+            e if k::Error::from_raw(e).is_some() && e < errors.len() as u64 => {
+                errors[e as usize] += 1;
+            }
             // Anything that is neither success nor a defined error code is a bug.
             _ => k::thread_exit(selftest::EXIT_CHECK_FAILED | 0xf0),
         }

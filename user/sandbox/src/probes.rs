@@ -5,14 +5,20 @@
 //! exception and the kernel must terminate *only this process* and report the
 //! fault to its supervisor. If an attack returns normally, the probe exits with
 //! [`selftest::EXIT_ESCAPED`].
+//!
+//! Attacks on kernel memory use the address the supervisor hands over: with KASLR
+//! nothing lives at a fixed kernel address, and an attack on an unmapped address
+//! would prove nothing.
 
 use core::arch::asm;
 use core::hint::black_box;
 use core::ptr::{read_volatile, write_volatile};
 
 use libkalkan::selftest::{self, mode};
-use libkalkan::{self as k, abi, println};
+use libkalkan::{self as k, Error, abi, println};
 
+/// Fixed kernel-half addresses (link base, start of the direct-map range). KASLR
+/// leaves nothing mapped there; they serve as hostile register values.
 const KERNEL_IMAGE: u64 = 0xffff_ffff_8000_0000;
 const KERNEL_PHYSMAP: u64 = 0xffff_8000_0010_0000;
 const NON_CANONICAL: u64 = 0x0000_8000_0000_0000;
@@ -66,20 +72,46 @@ unsafe fn call(addr: u64) {
     f();
 }
 
-/// Runs the probe for `mode`. Only returns if the attack was not stopped.
+/// Runs the probe for `mode`; `target` is the kernel address to attack, if any.
+/// Only returns if the attack was not stopped.
 #[allow(clippy::too_many_lines)]
-fn attack(mode: u64) -> Option<u64> {
+fn attack(mode: u64, target: u64) -> Option<u64> {
+    let kernel_attack = matches!(
+        mode,
+        mode::READ_KERNEL_CODE
+            | mode::READ_KERNEL_DATA
+            | mode::READ_KERNEL_STACK
+            | mode::READ_KERNEL_HEAP
+            | mode::READ_PHYSMAP
+            | mode::WRITE_KERNEL
+            | mode::WRITE_KERNEL_CODE
+            | mode::WRITE_KERNEL_STACK
+            | mode::WRITE_PHYSMAP
+            | mode::EXEC_KERNEL
+    );
+    if kernel_attack && target < 0xffff_8000_0000_0000 {
+        // No kernel address to attack: this would test nothing.
+        return Some(selftest::EXIT_CHECK_FAILED | 0x7a);
+    }
     // SAFETY: (applies to the whole block) every statement below is a deliberate
     // attack on the isolation boundary. It is expected to raise a CPU exception,
     // after which the kernel terminates this process; none of them can affect
     // memory this program relies on if it unexpectedly succeeds.
     unsafe {
         match mode {
-            mode::WRITE_KERNEL => write_volatile(KERNEL_IMAGE as *mut u64, 0x4141_4141_4141_4141),
-            mode::READ_PHYSMAP => {
-                black_box(read_volatile(KERNEL_PHYSMAP as *const u64));
+            mode::READ_KERNEL_CODE
+            | mode::READ_KERNEL_DATA
+            | mode::READ_KERNEL_STACK
+            | mode::READ_KERNEL_HEAP
+            | mode::READ_PHYSMAP => {
+                let leaked = read_volatile(target as *const u64);
+                println!("  read {leaked:#x} from kernel memory");
             }
-            mode::EXEC_KERNEL => call(KERNEL_IMAGE),
+            mode::WRITE_KERNEL
+            | mode::WRITE_KERNEL_CODE
+            | mode::WRITE_KERNEL_STACK
+            | mode::WRITE_PHYSMAP => write_volatile(target as *mut u64, 0x4141_4141_4141_4141),
+            mode::EXEC_KERNEL => call(target),
             mode::WRITE_CODE => write_volatile(attack as *const () as *mut u8, 0xc3),
             mode::WRITE_RODATA => write_volatile(black_box(READ_ONLY.as_ptr()).cast_mut(), 0),
             mode::EXEC_STACK => {
@@ -424,8 +456,29 @@ fn register_integrity() -> u64 {
     selftest::EXIT_OK
 }
 
-/// Entry point for every probe role.
-pub fn run(mode: u64) -> ! {
+/// Calls the supervisor, which receives the call and then receives again without
+/// replying: the kernel must release this caller with `EDEAD` instead of leaving
+/// it blocked forever.
+fn abandoned_call() -> u64 {
+    match k::call(selftest::slot::ENDPOINT, [selftest::ABANDON, 0, 0, 0], None) {
+        Err(Error::Dead) => selftest::EXIT_OK,
+        Err(_) => selftest::EXIT_CHECK_FAILED | 1,
+        Ok(_) => selftest::EXIT_CHECK_FAILED | 2,
+    }
+}
+
+/// Receives the supervisor's call and exits without answering it: the kernel must
+/// release the caller with `EDEAD`.
+fn server_dies() -> u64 {
+    match k::recv(selftest::slot::SERVER_EP, None) {
+        Ok(m) if m.words[0] == selftest::HOLD => selftest::EXIT_OK,
+        Ok(_) => selftest::EXIT_CHECK_FAILED | 1,
+        Err(_) => selftest::EXIT_CHECK_FAILED | 2,
+    }
+}
+
+/// Entry point for every probe role; `argument` comes from the supervisor.
+pub fn run(mode: u64, argument: u64) -> ! {
     let code = match mode {
         mode::SINGLE_STEP_SYSCALL => single_step_syscall(),
         mode::HOSTILE_STACK_AND_FLAGS => hostile_stack_and_flags(),
@@ -433,7 +486,19 @@ pub fn run(mode: u64) -> ! {
         mode::REGISTER_INTEGRITY => register_integrity(),
         // Exit straight away: the supervisor must still learn about it.
         mode::SILENT_EXIT => selftest::EXIT_SILENT,
-        _ => attack(mode).unwrap_or(selftest::EXIT_ESCAPED),
+        // --- process life cycle
+        mode::ABANDONED_CALL => abandoned_call(),
+        mode::SERVER_DIES => server_dies(),
+        mode::ZOMBIE | mode::ORPHANED_REPORT => selftest::EXIT_OK,
+        mode::SPIN => loop {
+            core::hint::spin_loop();
+        },
+        mode::BLOCK => {
+            // Never returns: the supervisor kills this process while it waits.
+            let _ = k::recv(selftest::slot::SERVER_EP, None);
+            selftest::EXIT_ESCAPED
+        }
+        _ => attack(mode, argument).unwrap_or(selftest::EXIT_ESCAPED),
     };
     k::thread_exit(code)
 }

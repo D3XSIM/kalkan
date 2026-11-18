@@ -45,11 +45,13 @@ systems, servers) is meant to live in user space.
    gathering → frame allocator → construction of the kernel's own page tables.
 3. The kernel switches **page tables and stack in one instruction sequence** to
    its own guard-paged stack.
-4. **Stage 2** (`stage2`): heap → `syscall` MSRs → local APIC → **security self
-   check** (`posture::verify` reads back control registers and walks its own page
-   tables) → **module verification** against digests compiled into the kernel →
-   creation of `init` and `sandbox` → reclaiming (and zeroing) bootloader memory →
-   first entry to user mode.
+4. **Stage 2** (`stage2`): the TSS is pointed at the guarded kernel and IST
+   stacks (they exist only in the kernel's own page tables) → heap → `syscall`
+   MSRs → local APIC (x2APIC mode whenever the CPU supports it, xAPIC otherwise)
+   → **security self check** (`posture::verify` reads back control registers and
+   walks its own page tables) → **module verification** against digests compiled
+   into the kernel → creation of `init` and `sandbox` → reclaiming (and zeroing)
+   bootloader memory → first entry to user mode.
 
 ## Memory
 
@@ -63,10 +65,13 @@ systems, servers) is meant to live in user space.
 | Direct map of RAM | `RW-` NX (`R--` for the kernel image's own frames) | random PML4 slot + random 1 GiB offset, chosen by the kernel |
 | Kernel stack (64 KiB) + 4 IST stacks (16 KiB: #DF, NMI, #MC, #DB) | `RW-` NX, guard page between each | random PML4 slot + random offset |
 | Heap (64 GiB virtual) | `RW-` NX | random PML4 slot + random offset |
-| Local APIC | `RW-` NX, uncached | random PML4 slot + random offset |
+| Local APIC (xAPIC mode only; in x2APIC mode its registers are MSRs and nothing is mapped) | `RW-` NX, uncached | random PML4 slot + random offset |
 
 The heap's top-level page-table entry is created at boot, so every address space
 created later shares it. No kernel mapping has the `USER` bit.
+
+None of these addresses appears in the kernel's log: it prints `<hidden>`
+instead (test kernels excepted, see [below](#test-kernels)).
 
 The bootloader's own direct map sits at a predictable address, so the kernel does
 not keep it: it builds a new one at a random location and switches to it together
@@ -175,32 +180,70 @@ exits voluntarily is reported the same way (`[0x100, exit code, 0, 0]`), so a
 supervisor is never left waiting for a thread that is gone. Otherwise the thread is
 terminated immediately. A fault never affects the kernel or other threads.
 
+### Thread life cycle
+
+No thread waits forever, and no dead thread keeps its resources:
+
+* A dying thread releases its capability space, its address space and every
+  capability it held **at once**. Until its report has been received, only its
+  small kernel record remains (`zombie`), queued on the fault endpoint.
+* A thread keeps its fault endpoint alive as a *handler*, not as a capability.
+  When the last capability to an endpoint goes away, nobody can ever receive from
+  it again: the endpoint is *orphaned*, every thread waiting on it is released
+  with `EDEAD`, queued reports are dropped, and later reports are never queued.
+* The one-shot reply right of a `call` is never lost silently: a server that
+  receives again without replying, or that dies while it owes a reply, releases
+  the caller with `EDEAD`.
+* `thread_kill` (needs `WRITE` on the thread capability) terminates a thread from
+  outside — running, ready or blocked — and unlinks it from every queue. No
+  report is sent: the holder of the capability decided.
+* Randomness is a capability too: `random` needs `READ` on the entropy
+  capability, which the root task can pass on or withhold.
+
 ## Resource accounting
 
 User space can only create objects (`untyped_retype`) from an *untyped* budget
 capability. Every object records which budget paid for it and refunds it when it
 is destroyed. Capabilities to new objects are recorded as children of the untyped
 capability, so revoking a delegated budget destroys everything built from it. Kernel tables (capabilities, CSpaces, threads, endpoints, frames,
-VSpaces) also have hard upper bounds.
+VSpaces) also have hard upper bounds, sized so that no process can exhaust them
+for the others: the capability table has room for every capability space to be
+full at once, and the endpoint table for every endpoint the root budget can pay
+for.
 
 ## Self-audit
 
 `kernel/src/kernel/audit.rs` can verify the complete object graph at any time:
 it recounts every reference from capabilities, threads and fault handlers,
 re-derives the per-frame mapping counters, compares every capability-held mapping
-with the actual page tables, checks budget conservation, IPC queues, thread
-states and the run queue, and re-checks the invariants of the derivation tree.
+with the actual page tables — and, the other way round, accounts for every page
+present in a user page table and recounts the page tables against the quota —
+checks budget conservation, IPC queues, the call/reply bookkeeping, thread states
+(including terminated threads) and the run queue, and re-checks the invariants of
+the derivation tree.
 
 It runs once before the first user instruction and once at shutdown. Built with
 the `audit` feature (as `cargo xtask test` does) it runs after every trap, which
 turns the adversarial test suite and the system call fuzzer into a search for
 state corruption rather than just for crashes. See [TESTING.md](TESTING.md).
 
-## Test processes
+## Test kernels
 
-Besides `init` and `sandbox`, the kernel creates `PROBE_COUNT` further, inactive
-instances of the sandbox image at boot ("probes"), each with its own address
-space, capability space and ASLR layout, and hands their thread and address space
-capabilities to the root task. The test suite starts one per attack. They are
-ordinary untrusted processes: a production image would simply set the count to 0.
+A kernel built with the `selftest` feature (`cargo xtask run` and `cargo xtask
+test` build one; `cargo xtask build` does not) differs from a normal kernel in
+exactly three ways:
+
+* besides `init` and `sandbox` it creates `PROBE_COUNT` further, inactive
+  instances of the sandbox image at boot ("probes"), each with its own address
+  space, capability space and ASLR layout, and hands their thread and address
+  space capabilities to the root task. The test suite starts one per attack or
+  life-cycle test. They are ordinary untrusted processes;
+* it answers the diagnostic system calls `kernel_stats` (resource counters for
+  the leak tests) and `kernel_layout` (addresses of live kernel code, data, stack,
+  heap and direct map, so that the suite attacks the real kernel despite KASLR) —
+  both need `READ` on the console capability, which no untrusted process gets;
+* its log shows addresses instead of `<hidden>`.
+
+A normal kernel answers both system calls with `ENOSYS`. `cargo xtask test` boots
+one as well and checks all of this.
 
