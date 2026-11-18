@@ -1,0 +1,20 @@
+[package]
+name = "kalkan-sandbox"
+description = "An untrusted Kalkan process that actively tries to break out of its sandbox."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kalkan-sandbox"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libkalkan = { path = "../libkalkan" }
+
+[lints]
+workspace = true

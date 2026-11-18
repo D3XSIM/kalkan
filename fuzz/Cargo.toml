@@ -1,0 +1,30 @@
+[package]
+name = "kalkan-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kcore = { package = "kalkan-core", path = "../kcore" }
+
+# Not part of the main workspace (needs nightly + cargo-fuzz).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cspace"
+path = "fuzz_targets/cspace.rs"
+test = false
+doc = false
+bench = false

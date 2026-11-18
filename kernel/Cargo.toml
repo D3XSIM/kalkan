@@ -1,0 +1,25 @@
+[package]
+name = "kalkan-kernel"
+description = "Kalkan: a capability-based, security-first microkernel for x86-64."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kalkan"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+# Exit QEMU through the `isa-debug-exit` device when the root task terminates.
+# Only enabled by `cargo xtask test`; never enable on real hardware.
+qemu-exit = []
+
+[dependencies]
+kcore = { package = "kalkan-core", path = "../kcore" }
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned for reproducible builds. Stable Rust only: no nightly features.
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-none"]

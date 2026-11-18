@@ -1,0 +1,24 @@
+[package]
+name = "kalkan-core"
+description = "Pure, 100% safe-Rust policy core of the Kalkan microkernel (capabilities, ELF validation, crypto)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "kcore"
+path = "src/lib.rs"
+
+# Intentionally no dependencies: this crate is part of the trusted computing base.
+[dependencies]
+
+[features]
+default = ["alloc"]
+# Capability database, arena and ELF validator (need a heap). User space only
+# needs the ABI definitions and builds without it.
+alloc = []
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+# cargo-deny configuration: supply-chain policy.
+#
+# The kernel and its policy core have no third-party dependencies at all. This
+# file makes sure it stays that way for everything that ships, and that any
+# dependency that is ever added comes from crates.io with an approved license
+# and no known advisories.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "deny"
+# Only intra-workspace path dependencies exist.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

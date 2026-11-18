@@ -1,0 +1,20 @@
+[package]
+name = "kalkan-init"
+description = "Kalkan root task: system bring-up and the security self-test suite."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kalkan-init"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libkalkan = { path = "../libkalkan" }
+
+[lints]
+workspace = true
