@@ -21,7 +21,8 @@ contributions are held to a few strict rules.
    never panic.
 6. **Test the attack, not just the feature.** New system calls or object types come
    with tests in `user/init` (and, where it makes sense, in `user/sandbox`) that show
-   misuse is refused.
+   misuse is refused, and every new piece of derived kernel state is covered by
+   the self-audit in `kernel/src/kernel/audit.rs`. See [docs/TESTING.md](docs/TESTING.md).
 
 ## Before opening a pull request
 
@@ -30,7 +31,8 @@ cargo fmt --all
 cargo clippy -p kalkan-core -p xtask --all-targets -- -D warnings
 cargo clippy -p kalkan-kernel --target x86_64-unknown-none -- -D warnings
 cargo clippy -p libkalkan -p kalkan-init -p kalkan-sandbox --target x86_64-unknown-none -- -D warnings
-cargo test -p kalkan-core
+cargo test -p kalkan-core -p xtask
+cargo test -p kalkan-core --release -- --ignored
 cargo xtask test
 ```
 

@@ -59,8 +59,12 @@ pub mod sys {
     pub const EP_REPLY: u64 = 16;
     /// `random() -> value` — 64 bits from the kernel CSPRNG.
     pub const RANDOM: u64 = 17;
+    /// `kernel_stats(console) -> (free frames, heap bytes, capabilities, threads,
+    /// frame objects, endpoints)` — aggregate kernel resource usage. Requires `READ`
+    /// on a console capability (diagnostics only; used by the leak tests).
+    pub const KERNEL_STATS: u64 = 18;
     /// Number of system calls. Any number `>= COUNT` returns [`super::Error::NoSys`].
-    pub const COUNT: u64 = 18;
+    pub const COUNT: u64 = 19;
 }
 
 /// Error codes returned in `rax`. `0` means success.
@@ -173,7 +177,7 @@ pub mod slot {
     pub const SELF_THREAD: u64 = 2;
     /// An untyped memory budget.
     pub const UNTYPED: u64 = 3;
-    /// The kernel debug console (`WRITE | GRANT`).
+    /// The kernel debug console (`READ | WRITE | GRANT`).
     pub const CONSOLE: u64 = 4;
     /// The (not yet started) sandbox thread.
     pub const SANDBOX_THREAD: u64 = 5;
@@ -181,10 +185,19 @@ pub mod slot {
     pub const SANDBOX_VSPACE: u64 = 6;
     /// First slot that is free for the root task to use.
     pub const FIRST_FREE: u64 = 8;
+    /// Thread capabilities of the probe processes (`PROBE_COUNT` slots).
+    pub const PROBE_THREAD_FIRST: u64 = 64;
+    /// Address space capabilities of the probe processes (`PROBE_COUNT` slots).
+    pub const PROBE_VSPACE_FIRST: u64 = 128;
 }
 
+/// Number of *probe* processes the kernel creates at boot besides the sandbox:
+/// extra, never-started instances of the sandbox image. The self-test suite starts
+/// each one to perform a single attack that is expected to get it killed.
+pub const PROBE_COUNT: u64 = 47;
+
 /// Number of slots in every capability space.
-pub const CSPACE_SLOTS: usize = 64;
+pub const CSPACE_SLOTS: usize = 256;
 
 /// Value meaning "no capability" in cap-transfer arguments.
 pub const NO_CAP: u64 = u64::MAX;

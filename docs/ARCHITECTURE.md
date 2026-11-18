@@ -37,8 +37,7 @@ systems, servers) is meant to live in user space.
 
 ## Boot sequence
 
-1. **Limine** loads the kernel at a random address (KASLR), with a randomised
-   direct map. Before loading, it verifies the BLAKE2b-512 digest of the kernel
+1. **Limine** loads the kernel at a random address (KASLR). Before loading, it verifies the BLAKE2b-512 digest of the kernel
    and of every module listed in `limine.conf`.
 2. **Stage 1** (`boot_main`, on the bootloader's stack and page tables):
    serial log → GDT/TSS (with early IST stacks) → IDT → CPU feature detection →
@@ -61,13 +60,18 @@ systems, servers) is meant to live in user space.
 | Kernel `.text` | `R-X` | KASLR (Limine) |
 | Kernel `.rodata` (incl. relocated `.data.rel.ro`, `.got`) | `R--` | KASLR |
 | Kernel `.data`/`.bss` | `RW-` NX | KASLR |
-| Direct map of RAM | `RW-` NX (`R--` for the kernel image's own frames) | random (Limine) |
-| Kernel stack (64 KiB) + 3 IST stacks (16 KiB) | `RW-` NX, guard page between each | random PML4 slot + random offset |
+| Direct map of RAM | `RW-` NX (`R--` for the kernel image's own frames) | random PML4 slot + random 1 GiB offset, chosen by the kernel |
+| Kernel stack (64 KiB) + 4 IST stacks (16 KiB: #DF, NMI, #MC, #DB) | `RW-` NX, guard page between each | random PML4 slot + random offset |
 | Heap (64 GiB virtual) | `RW-` NX | random PML4 slot + random offset |
 | Local APIC | `RW-` NX, uncached | random PML4 slot + random offset |
 
 The heap's top-level page-table entry is created at boot, so every address space
 created later shares it. No kernel mapping has the `USER` bit.
+
+The bootloader's own direct map sits at a predictable address, so the kernel does
+not keep it: it builds a new one at a random location and switches to it together
+with its page tables. Boot modules are recorded as physical ranges beforehand, and
+the frame allocator is re-attached to its bitmap through the new mapping.
 
 ### Physical memory
 
@@ -178,3 +182,25 @@ capability. Every object records which budget paid for it and refunds it when it
 is destroyed. Capabilities to new objects are recorded as children of the untyped
 capability, so revoking a delegated budget destroys everything built from it. Kernel tables (capabilities, CSpaces, threads, endpoints, frames,
 VSpaces) also have hard upper bounds.
+
+## Self-audit
+
+`kernel/src/kernel/audit.rs` can verify the complete object graph at any time:
+it recounts every reference from capabilities, threads and fault handlers,
+re-derives the per-frame mapping counters, compares every capability-held mapping
+with the actual page tables, checks budget conservation, IPC queues, thread
+states and the run queue, and re-checks the invariants of the derivation tree.
+
+It runs once before the first user instruction and once at shutdown. Built with
+the `audit` feature (as `cargo xtask test` does) it runs after every trap, which
+turns the adversarial test suite and the system call fuzzer into a search for
+state corruption rather than just for crashes. See [TESTING.md](TESTING.md).
+
+## Test processes
+
+Besides `init` and `sandbox`, the kernel creates `PROBE_COUNT` further, inactive
+instances of the sandbox image at boot ("probes"), each with its own address
+space, capability space and ASLR layout, and hands their thread and address space
+capabilities to the root task. The test suite starts one per attack. They are
+ordinary untrusted processes: a production image would simply set the count to 0.
+

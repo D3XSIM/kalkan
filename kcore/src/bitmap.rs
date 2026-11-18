@@ -46,6 +46,22 @@ impl<'a> FrameBitmap<'a> {
         })
     }
 
+    /// Continues with the same bitmap contents reachable through a different
+    /// slice (the kernel uses this when it moves its direct map of physical
+    /// memory: same memory, new virtual address). `words` must alias the storage
+    /// this bitmap was created with; the old slice is not touched again.
+    pub fn with_storage<'b>(self, words: &'b mut [u64]) -> Option<FrameBitmap<'b>> {
+        if words.len() < Self::words_needed(self.frames) {
+            return None;
+        }
+        Some(FrameBitmap {
+            words,
+            frames: self.frames,
+            free: self.free,
+            hint: self.hint,
+        })
+    }
+
     /// Total number of frames managed.
     #[must_use]
     pub const fn frames(&self) -> usize {
@@ -185,8 +201,68 @@ mod tests {
     }
 
     #[test]
+    fn storage_can_be_swapped() {
+        let mut words = vec![0u64; 2];
+        let mut bm = FrameBitmap::new(&mut words, 100).unwrap();
+        bm.release_range(0, 100);
+        let a = bm.alloc().unwrap();
+        let free = bm.free_frames();
+        // Simulate "same memory, different address" with a copy of the contents.
+        let mut copy = bm.words.to_vec();
+        let mut too_small = vec![0u64; 1];
+        let bm = bm.with_storage(&mut copy).unwrap();
+        assert_eq!(bm.free_frames(), free);
+        assert!(bm.is_allocated(a));
+        assert!(bm.with_storage(&mut too_small).is_none());
+    }
+
+    #[test]
     fn storage_too_small() {
         let mut words = vec![0u64; 1];
         assert!(FrameBitmap::new(&mut words, 65).is_none());
+    }
+
+    /// Differential test against a `HashSet` of free frames.
+    #[test]
+    fn random_operations_match_a_model() {
+        let mut rng = crate::testutil::XorShift::new(0xb17_3a9);
+        const FRAMES: usize = 333;
+        let mut words = vec![0u64; FrameBitmap::words_needed(FRAMES)];
+        let mut bm = FrameBitmap::new(&mut words, FRAMES).unwrap();
+        let mut free: HashSet<usize> = HashSet::new();
+        for _ in 0..200_000 {
+            let frame = rng.below(FRAMES as u64 + 40) as usize; // sometimes out of range
+            let count = rng.below(9) as usize;
+            match rng.below(6) {
+                0 => {
+                    bm.release_range(frame, count);
+                    free.extend((frame..frame + count).filter(|f| *f < FRAMES));
+                }
+                1 => {
+                    bm.reserve_range(frame, count);
+                    for f in frame..frame + count {
+                        free.remove(&f);
+                    }
+                }
+                2 | 3 => match bm.alloc() {
+                    Some(f) => assert!(free.remove(&f), "allocated frame {f} was not free"),
+                    None => assert!(free.is_empty()),
+                },
+                _ => {
+                    let expected = if frame >= FRAMES {
+                        Err(BitmapError::OutOfRange)
+                    } else if free.contains(&frame) {
+                        Err(BitmapError::DoubleFree)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(bm.free(frame), expected);
+                    if expected.is_ok() {
+                        free.insert(frame);
+                    }
+                }
+            }
+            assert_eq!(bm.free_frames(), free.len());
+        }
     }
 }

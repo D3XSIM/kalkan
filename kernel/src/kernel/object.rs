@@ -83,6 +83,8 @@ pub type Charge = Option<(UntypedId, u64)>;
 
 #[derive(Debug)]
 pub struct Untyped {
+    /// Size of the budget; `remaining` plus all outstanding charges always equals it.
+    pub total: u64,
     pub remaining: u64,
     pub refs: u32,
 }

@@ -214,6 +214,37 @@ pub fn random() -> u64 {
     sys(abi::sys::RANDOM, [0; 6]).rdi
 }
 
+/// Aggregate kernel resource usage (see [`kernel_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelStats {
+    /// Free physical frames.
+    pub free_frames: u64,
+    /// Bytes allocated on the kernel heap.
+    pub heap_bytes: u64,
+    /// Live capabilities in all capability spaces.
+    pub capabilities: u64,
+    /// Live threads.
+    pub threads: u64,
+    /// Live frame objects.
+    pub frames: u64,
+    /// Live endpoints.
+    pub endpoints: u64,
+}
+
+/// Reads the kernel's resource statistics (requires `READ` on the console cap).
+pub fn kernel_stats(console: u64) -> Result<KernelStats> {
+    let r = sys(abi::sys::KERNEL_STATS, [console, 0, 0, 0, 0, 0]);
+    r.status()?;
+    Ok(KernelStats {
+        free_frames: r.rdi,
+        heap_bytes: r.rsi,
+        capabilities: r.rdx,
+        threads: r.r10,
+        frames: r.r8,
+        endpoints: r.r9,
+    })
+}
+
 fn cap_arg(cap: Option<u64>) -> u64 {
     cap.unwrap_or(abi::NO_CAP)
 }
@@ -272,38 +303,7 @@ pub fn reply(msg: [u64; 4]) -> Result<()> {
     sys(abi::sys::EP_REPLY, [msg[0], msg[1], msg[2], msg[3], 0, 0]).status()
 }
 
-/// Protocol shared by the root task and the sandbox in the self-test suite.
-pub mod selftest {
-    /// Badge of the sandbox's client capability to the root task's endpoint.
-    pub const CLIENT_BADGE: u64 = 0xc11e47;
-    /// Badge the kernel delivers with the sandbox's fault reports.
-    pub const FAULT_BADGE: u64 = 0xfa017;
-    /// `[REPORT, test_id, passed, 0]`.
-    pub const REPORT: u64 = 1;
-    /// `[TRANSFER, 0, 0, 0]` + a capability; the reply carries the message info flags.
-    pub const TRANSFER: u64 = 2;
-    /// `[DONE, passed, failed, 0]`.
-    pub const DONE: u64 = 3;
-    /// Text the root task places in the read-only shared page.
-    pub const SHARED_SECRET: &[u8; 20] = b"kalkan-shared-memory";
-
-    /// Capability slots in the sandbox's CSpace (granted by the root task).
-    ///
-    /// Slots 3–5 are deliberately left empty: they are the root task's untyped,
-    /// console and thread slots, which the sandbox tries to use.
-    pub mod slot {
-        /// Send-only, badged endpoint to the root task.
-        pub const ENDPOINT: u64 = 1;
-        /// Console, `WRITE` only (cannot be passed on).
-        pub const CONSOLE: u64 = 2;
-        /// Read-only shared frame.
-        pub const SHARED_FRAME: u64 = 6;
-        /// The sandbox's own address space (map rights only).
-        pub const VSPACE: u64 = 7;
-        /// First free slot.
-        pub const FIRST_FREE: u64 = 8;
-    }
-}
+pub mod selftest;
 
 static CONSOLE: AtomicU64 = AtomicU64::new(abi::slot::NULL);
 

@@ -213,4 +213,48 @@ mod tests {
         a.insert(()).unwrap();
         assert_eq!(a.insert(()), Err(ArenaFull));
     }
+
+    /// Differential test against a trivial model: every id ever issued either
+    /// resolves to exactly the value stored under it, or to nothing.
+    #[test]
+    fn random_operations_match_a_model() {
+        let mut rng = crate::testutil::XorShift::new(0xa5e7_a1e7);
+        let mut arena = Arena::with_limit(24);
+        let mut issued: std::vec::Vec<(Id<u64>, u64, bool)> = std::vec::Vec::new();
+        for step in 0..200_000u64 {
+            match rng.below(3) {
+                0 | 1 => {
+                    let live = issued.iter().filter(|e| e.2).count();
+                    match arena.insert(step) {
+                        Ok(id) => {
+                            assert!(live < 24, "limit exceeded");
+                            assert!(
+                                !issued.iter().any(|e| e.2 && e.0 == id),
+                                "id reused while live"
+                            );
+                            issued.push((id, step, true));
+                        }
+                        Err(ArenaFull) => assert_eq!(live, 24),
+                    }
+                }
+                _ if !issued.is_empty() => {
+                    let pick = rng.below(issued.len() as u64) as usize;
+                    let (id, value, live) = issued[pick];
+                    assert_eq!(arena.remove(id), live.then_some(value));
+                    issued[pick].2 = false;
+                }
+                _ => {}
+            }
+            if step % 64 == 0 {
+                for &(id, value, live) in &issued {
+                    assert_eq!(arena.get(id).copied(), live.then_some(value));
+                }
+                assert_eq!(arena.len(), issued.iter().filter(|e| e.2).count());
+                assert_eq!(arena.iter().count(), arena.len());
+            }
+            if issued.len() > 4096 {
+                issued.retain(|e| e.2); // forget most dead ids, keep the test fast
+            }
+        }
+    }
 }

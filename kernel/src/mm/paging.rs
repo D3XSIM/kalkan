@@ -139,36 +139,51 @@ fn table_is_empty(table_phys: u64) -> bool {
     unsafe { (*table(table_phys)).iter().all(|&e| e & PRESENT == 0) }
 }
 
-/// Removes a 4 KiB **user** mapping and frees every intermediate table that
-/// became empty (including the top-level entry, which is always in the private
-/// user half). Without this, map/unmap cycling at different addresses would
-/// allocate page tables without bound. Returns the frame that was mapped.
-pub fn unmap_user(pml4: u64, vaddr: u64, free_table: &mut dyn FnMut(u64)) -> Option<u64> {
+/// Frees every *empty* page table on the path to the user address `vaddr`,
+/// bottom-up (including the top-level entry, which is always in the private user
+/// half). Without this, mapping and unmapping at ever new addresses — or failed
+/// mappings — would leave page tables behind without bound.
+pub fn prune_user(pml4: u64, vaddr: u64, free_table: &mut dyn FnMut(u64)) {
     debug_assert!(index(vaddr, 3) < 256, "not a user address");
     // tables[level] is the table *at* `level` on the path to `vaddr`.
     let mut tables = [0u64; 4];
     tables[3] = pml4;
-    for level in (1..=3).rev() {
+    let mut lowest = 3usize;
+    for level in (1..=3u32).rev() {
         let entry = read_entry(tables[level as usize], vaddr, level);
         if entry & PRESENT == 0 || entry & HUGE != 0 {
-            return None;
+            break;
         }
-        tables[level as usize - 1] = entry & ADDR_MASK;
+        lowest = level as usize - 1;
+        tables[lowest] = entry & ADDR_MASK;
     }
-    let leaf = read_entry(tables[0], vaddr, 0);
-    if leaf & PRESENT == 0 {
-        return None;
-    }
-    write_entry(tables[0], vaddr, 0, 0);
-    // Prune upwards: PT, PD, PDPT.
-    for level in 0..3u32 {
-        let t = tables[level as usize];
+    for level in lowest..3 {
+        let t = tables[level];
         if !table_is_empty(t) {
             break;
         }
-        write_entry(tables[level as usize + 1], vaddr, level + 1, 0);
+        write_entry(tables[level + 1], vaddr, level as u32 + 1, 0);
         free_table(t);
     }
+}
+
+/// Removes a 4 KiB **user** mapping and prunes the page tables that became empty.
+/// Returns the frame that was mapped. The caller invalidates the TLB.
+pub fn unmap_user(pml4: u64, vaddr: u64, free_table: &mut dyn FnMut(u64)) -> Option<u64> {
+    let mut current = pml4;
+    for level in (1..=3).rev() {
+        let entry = read_entry(current, vaddr, level);
+        if entry & PRESENT == 0 || entry & HUGE != 0 {
+            return None;
+        }
+        current = entry & ADDR_MASK;
+    }
+    let leaf = read_entry(current, vaddr, 0);
+    if leaf & PRESENT == 0 {
+        return None;
+    }
+    write_entry(current, vaddr, 0, 0);
+    prune_user(pml4, vaddr, free_table);
     Some(leaf & ADDR_MASK)
 }
 

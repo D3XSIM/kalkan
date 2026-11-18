@@ -57,6 +57,7 @@ pub fn init() {
     for (vector, gate) in idt.0.iter_mut().enumerate() {
         let handler = stubs + vector as u64 * 16;
         let ist = match vector {
+            1 => gdt::IST_DEBUG,
             2 => gdt::IST_NMI,
             8 => gdt::IST_DOUBLE_FAULT,
             18 => gdt::IST_MACHINE_CHECK,

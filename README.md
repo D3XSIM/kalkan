@@ -11,7 +11,7 @@
 ![Dependencies](https://img.shields.io/badge/kernel%20dependencies-0-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
-[Türkçe README](README.tr.md) · [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [System calls](docs/SYSCALLS.md) · [Building](docs/BUILDING.md)
+[Türkçe README](README.tr.md) · [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [System calls](docs/SYSCALLS.md) · [Testing](docs/TESTING.md) · [Building](docs/BUILDING.md)
 
 </div>
 
@@ -21,8 +21,8 @@ Kalkan is a small microkernel built around one idea: **nothing is trusted that c
 be checked instead.** User programs hold no ambient authority — every kernel object
 is reached through an unforgeable *capability* whose rights can only ever shrink.
 The kernel verifies its own hardware protections at boot, verifies every program it
-loads, and ships with an adversarial test suite in which an untrusted process tries
-to break out of its sandbox on every CI run.
+loads, audits its own data structures, and ships with an adversarial test suite in
+which untrusted processes attack it from every angle on every CI run.
 
 ```text
 Security posture:
@@ -30,26 +30,32 @@ Security posture:
   [PASS] SMEP (no kernel exec of user pages)    CR4.SMEP
   [PASS] SMAP (no kernel access to user pages)  CR4.SMAP, never lifted
   [PASS] UMIP (hide descriptor tables)          CR4.UMIP
-  [PASS] RDTSC restricted to kernel             CR4.TSD
-  [PASS] x87/SSE/AVX disabled for user space    no SIMD state to leak
   [PASS] W^X kernel image                       .text R-X, .rodata R--, .data RW-
-  [PASS] Direct map non-executable              physmap is RW-, NX
+  [PASS] Kernel image alias in direct map       read-only, NX
   [PASS] Kernel stack guard pages               unmapped page below and above
-  [PASS] KASLR (kernel image)                   slide 0x6e294000
-  [PASS] Randomised stack/heap/MMIO placement   PML4 slots [318, 271, 494]
+  [PASS] KASLR (kernel image)                   slide 0x4be4e000
+  [PASS] Randomised stack/heap/MMIO placement   PML4 slots [472, 403, 366]
 Boot module integrity (BLAKE2b-512):
-  [PASS] init      161744 bytes  b0323fd9e0fb0f05...
-  [PASS] sandbox   128848 bytes  5c322bdef14729e5...
+  [PASS] init      202032 bytes  87172c1940a21687...
+  [PASS] sandbox   222992 bytes  d933d13af9732011...
 ...
 [sandbox]   [BLOCKED] add GRANT to its console capability (EPERM)
 [sandbox]   [BLOCKED] forge a different badge (identity spoofing) (EINVAL)
-[sandbox]   [BLOCKED] smuggle a non-grantable capability over IPC (transfer refused by the kernel)
-[sandbox]   [BLOCKED] make the kernel read kernel memory for us (EFAULT)
+[sandbox]   [BLOCKED] smuggle a capability over IPC (its console capability)
+[sandbox]   [BLOCKED] exhaust kernel memory by map/unmap cycling (page tables reclaimed)
 [sandbox]   [INFO] terminal escape injection attempt follows: ?[2J?[31mFAKE KERNEL LOG?[0m
-[sandbox]   reading kernel memory at 0xffffffff80000000 ...
-[fault] thread 'sandbox' killed: page fault (vector 14) at rip=0x96bcff8210 addr=0xffffffff80000000 err=0x4
-[init]   [PASS] sandbox killed on its kernel memory access (page fault at 0xffffffff80000000)
-[init] KALKAN-TEST: PASS - all 62 security tests passed
+[init]   [PASS] sandbox escape attempts all refused (62 checks passed, 0 failed)
+[init] --- fault containment: one process per attack
+[init]   [PASS] write to kernel memory (killed: page fault at 0xffffffff80000000, error 0x6)
+[init]   [PASS] overflow its stack into the guard page (killed: page fault at 0x7c8f9a541c78, error 0x6)
+[init]   [PASS] redirect the system call entry (wrmsr LSTAR) (killed: general protection fault)
+[init]   [PASS] fake a timer interrupt (int 32) (killed: general protection fault)
+[init]   [PASS] iretq into ring 0 (killed: general protection fault)
+[init]   [PASS] system calls with a hostile stack pointer and flags (exited with 0x600d)
+[probe46]   fuzzer: 24000 system calls, 2114 succeeded, errors by code [3520, 321, 4763, ...]
+[init]   [PASS] every terminated process returned all of its kernel objects
+[init] KALKAN-TEST: PASS - all 120 security tests passed
+[kernel] audit: object graph consistent (9 capabilities, 1 threads, ...); 44619 audits passed
 [kernel] system shut down cleanly
 ```
 
@@ -62,17 +68,19 @@ Boot module integrity (BLAKE2b-512):
 | 🧪 **Policy you can test** | All access-control decisions live in [`kcore`](kcore/src/lib.rs): `#![forbid(unsafe_code)]`, zero dependencies, unit-tested and property-tested on the host, fuzzed in CI. |
 | 🧱 **Hardware hardening, verified at boot** | NX, SMEP, SMAP (never lifted), UMIP, CR0.WP, CR4.TSD, no user SIMD, W^X everywhere, non-executable physmap, guard pages, KASLR — and the kernel *checks* each one by inspecting its own control registers and page tables. Fail-closed if a mandatory protection is missing. |
 | 🔗 **Verified boot chain** | Pinned bootloader (tag + commit + BLAKE2b). The bootloader verifies kernel and modules; the kernel verifies modules **again** against digests compiled into it. Tampering is tested in CI. |
-| ⚔️ **Adversarial test suite** | 62 boot-time security tests, including an untrusted process that actively attacks the kernel, plus a tamper test of the boot partition. |
+| ⚔️ **Adversarial test suite** | 120 boot-time security checks: a sandbox with 62 escape attempts, **47 probe processes** that each try one hardware-level attack (kernel memory, W^X, privileged instructions, ring-0 returns, hostile stack/flags, ...), and a **system call fuzzer** — run on three machine sizes, plus fail-closed and boot-tampering scenarios. |
+| 🔍 **The kernel audits itself** | A built-in auditor recomputes every reference count, mapping counter, budget, queue and page-table entry from first principles. In test builds it runs after *every* trap — about 44 000 times per boot. |
 | 📦 **Zero-dependency kernel** | No third-party crates in the kernel or its policy core; the supply chain is the Rust toolchain and one pinned bootloader binary. |
 
 ### By the numbers
 
 | Component | Lines of Rust* | `unsafe` |
 |---|---:|---|
-| `kcore` — policy core | ~2 200 (incl. tests) | **forbidden** |
-| `kernel/src/kernel` — objects, IPC, syscalls, loader | ~1 200 | **denied** |
-| `kernel/src/arch` + `boot.rs` + `sync.rs` | ~1 400 | allowed, every block justified |
-| `kernel/src/mm` — memory management | ~900 | allowed, every block justified |
+| `kcore` — policy core | ~2 800 (more than half of it tests) | **forbidden** |
+| `kernel/src/kernel` — objects, IPC, syscalls, loader, self-audit | ~1 550 | **denied** |
+| `kernel/src/arch` + `boot.rs` + `sync.rs` | ~1 200 | allowed, every block justified |
+| `kernel/src/mm` — memory management | ~1 000 | allowed, every block justified |
+| `user/` — root task, sandbox, probes, fuzzer | ~2 000 | attack code only |
 | Third-party crates in the kernel | 0 | — |
 
 <sub>*non-blank, non-comment lines</sub>
@@ -123,16 +131,18 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | ret2usr / user data abuse | SMEP + SMAP, never lifted (no `stac` in the kernel) | `kernel/src/arch/x86_64/cpu.rs` |
 | Code injection | W^X for kernel image, physmap, heap, stacks and user programs; W+X mappings are unrepresentable, and W^X holds per *frame* across aliases; the physmap alias of the kernel image is read-only | `kernel/src/mm/*`, `kcore/src/elf.rs` |
 | Malformed executables | Strict, panic-free ELF validator (fuzzed); no interpreter, TLS, text relocations or dynamic linking | `kcore/src/elf.rs` |
-| Address disclosure | KASLR, randomised physmap, randomised kernel stack/heap/MMIO slots, user ASLR, UMIP | `kernel/src/mm/kspace.rs`, `kernel/src/kernel/loader.rs` |
+| Address disclosure | KASLR; the kernel moves its direct map of physical memory to a random address; randomised kernel stack/heap/MMIO slots; user ASLR; UMIP — all checked across boots in CI | `kernel/src/mm/kspace.rs`, `kernel/src/kernel/loader.rs` |
 | Spectre v1 | Branch-free index clamping on syscall numbers and capability slots | `kcore/src/nospec.rs` |
 | Spectre v2 / MDS / SWAPGS | IBRS + STIBP always on, IBPB on address-space switch, VERW on return (when supported), `lfence` after `swapgs` | `kernel/src/arch/x86_64/` |
 | Speculative gadgets via stale registers | All GPRs zeroed on kernel entry | `kernel/src/arch/x86_64/entry.rs` |
 | SYSRET privilege escalation (CVE-2012-0217) | Kernel always returns with `iretq`; RFLAGS/CS/SS sanitised | `kernel/src/arch/x86_64/entry.rs` |
+| Debug trap on the syscall entry path (cf. CVE-2018-8897) | TF masked on `syscall`; `#DB` runs on its own IST stack; debug registers cleared | `kernel/src/arch/x86_64/` |
+| Stray entry points | `sysenter` MSRs zeroed, no LDT, every IDT gate DPL 0, no I/O bitmap | `kernel/src/arch/x86_64/` |
 | SIMD state leakage (LazyFP) | x87/SSE/AVX disabled for user space | `kernel/src/arch/x86_64/cpu.rs` |
 | Cache-timing attacks | `rdtsc` restricted to ring 0 | `kernel/src/arch/x86_64/cpu.rs` |
 | Information leaks via memory reuse | Frames zeroed on allocation *and* free; heap blocks zeroed; bootloader memory zeroed on reclaim | `kernel/src/mm/frame.rs`, `kernel/src/mm/heap.rs` |
 | Heap corruption | Encoded (safe-linked) free lists, poisoning, double-free detection, guard pages — corruption panics | `kernel/src/mm/heap.rs` |
-| Kernel stack overflow | Guard pages + IST stacks for #DF/NMI/#MC; stack probes | `kernel/src/mm/kspace.rs` |
+| Kernel stack overflow | Guard pages + IST stacks for #DF/NMI/#MC/#DB | `kernel/src/mm/kspace.rs` |
 | Resource exhaustion | Untyped memory budgets with refunds and revocation; per-address-space page-table quota with reclamation; a frame reserve user space can never touch; hard limits on every kernel table | `kernel/src/kernel/mod.rs` |
 | Integer overflow | `overflow-checks = true` in release builds; checked arithmetic on all untrusted input | `Cargo.toml` |
 | Terminal injection | User console output is sanitised (no ESC / control characters) | `kernel/src/log.rs` |
@@ -153,7 +163,8 @@ toolchain from `rust-toolchain.toml` is installed automatically.
 # macOS:                brew install qemu
 
 cargo xtask run      # build everything and boot Kalkan in QEMU
-cargo xtask test     # security suite + boot tamper test (what CI runs)
+cargo xtask test     # every security scenario (what CI runs, ~2.5 min)
+cargo xtask test --quick   # suite + one tamper test (~20 s)
 cargo test -p kalkan-core   # host unit/property tests of the policy core
 ```
 
@@ -170,24 +181,31 @@ kernel/
   src/kernel/     objects, scheduler, IPC, system calls, program loader (no unsafe)
   src/boot.rs     Limine protocol (no third-party crate)
   src/posture.rs  boot-time security self check
+  src/kernel/audit.rs   run-time self-audit of the whole object graph
 user/
   libkalkan/      system call library
   init/           root task and the adversarial test suite
-  sandbox/        untrusted process that tries to escape
+  sandbox/        the attacker: escape suite, 47 fault probes, system call fuzzer
 xtask/            build, run and test orchestration (cargo xtask)
 fuzz/             cargo-fuzz targets
-docs/             architecture, threat model, system calls, building
+docs/             architecture, threat model, system calls, testing, building
 ```
 
 ## Testing
 
-| Layer | How | Command |
+| Layer | What it does | Command |
 |---|---|---|
-| Policy core | Unit tests, exhaustive rights tests, randomised model checks, RFC test vectors (ChaCha20, BLAKE2b) | `cargo test -p kalkan-core` |
-| Parsers | Truncation + 20 000 random mutations in unit tests; libFuzzer in CI | `cargo +nightly fuzz run elf` |
-| Whole system | Boots in QEMU; 62 security tests incl. an attacking process | `cargo xtask test` |
-| Boot integrity | Flips one byte of a module and strips its bootloader hash — the kernel must refuse it | `cargo xtask test` |
+| Policy core | 54 host tests: exhaustive rights checks, a **differential test against an independent reference model** of the capability database, test vectors cross-checked with OpenSSL and Python's `hashlib`, ELF generators and mutation | `cargo test -p kalkan-core` |
+| Stress | 1.9 million model steps, 2 million parser mutations | `cargo test -p kalkan-core --release -- --ignored` |
+| Fuzzing | libFuzzer targets for the ELF validator and the capability database | `cargo +nightly fuzz run elf` |
+| Static claims | No third-party packages, `unsafe` confined, no `stac`/`sysret`, CI pinned, docs match the ABI | `cargo xtask check` |
+| Whole system | 120 checks in QEMU with the kernel auditing itself after every trap; 128 MiB, 256 MiB and 5 GiB of RAM | `cargo xtask test` |
+| Randomisation | Kernel image, direct map, kernel regions and user programs must move between boots | `cargo xtask test` |
+| Fail-closed | CPUs without NX, SMEP or SMAP must be refused | `cargo xtask test` |
+| Boot integrity | Flipped, swapped, truncated, extra and missing modules, and a modified kernel, must never reach user space | `cargo xtask test` |
 | Code quality | `rustfmt`, Clippy with `-D warnings`, `undocumented_unsafe_blocks = deny` | CI |
+
+Details: [docs/TESTING.md](docs/TESTING.md).
 
 ## Roadmap
 
@@ -202,7 +220,7 @@ docs/             architecture, threat model, system calls, building
 ## Disclaimer
 
 Kalkan is an educational and research project. It has not been formally verified
-or independently audited and must not be relied on to protect real data. Please
+or audited by a third party and must not be relied on to protect real data. Please
 report security issues as described in [SECURITY.md](SECURITY.md).
 
 ## License

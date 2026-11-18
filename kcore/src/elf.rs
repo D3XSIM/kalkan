@@ -802,4 +802,112 @@ mod tests {
             let _ = parse(&junk.bytes(len), &lim());
         }
     }
+
+    /// Builds a random image that satisfies every rule of the loader.
+    fn random_valid_image(rng: &mut XorShift) -> (Vec<u8>, usize) {
+        let count = 1 + rng.below(5) as usize;
+        let exec = rng.below(count as u64) as usize;
+        let mut phdrs = Vec::new();
+        let mut page = 1 + rng.below(4);
+        let mut entry = 0;
+        for i in 0..count {
+            let pages = 1 + rng.below(3);
+            let mem = pages * PAGE - rng.below(PAGE - 16);
+            let file = if i == exec {
+                16 + rng.below(mem - 15)
+            } else {
+                rng.below(mem + 1)
+            };
+            let flags = match (i == exec, rng.below(3)) {
+                (true, _) => PF_R | PF_X,
+                (false, 0) => PF_R,
+                (false, 1) => PF_R | PF_W,
+                (false, _) => PF_X,
+            };
+            let vaddr = page * PAGE;
+            if i == exec {
+                entry = vaddr + rng.below(file);
+            }
+            phdrs.push(load(flags, vaddr, vaddr, file, mem));
+            page += pages + rng.below(3);
+        }
+        let len = (page * PAGE) as usize;
+        (build(3, entry, &phdrs, len), count)
+    }
+
+    #[test]
+    fn random_valid_images_are_accepted() {
+        let mut rng = XorShift::new(0xe1f_600d);
+        for _ in 0..3000 {
+            let (file, count) = random_valid_image(&mut rng);
+            let image = parse(&file, &lim()).expect("a valid image was rejected");
+            assert_eq!(image.segments.len(), count);
+            assert!(image.relocatable);
+            for pair in image.segments.windows(2) {
+                assert!(pair[0].page_end() <= pair[1].page_start());
+            }
+        }
+    }
+
+    #[test]
+    fn one_violation_is_enough_to_reject() {
+        let mut rng = XorShift::new(0xbad_e1f);
+        for round in 0..3000 {
+            let (file, count) = random_valid_image(&mut rng);
+            let victim = EHDR_SIZE + rng.below(count as u64) as usize * PHDR_SIZE;
+            let mut bad = file.clone();
+            let expected = match round % 5 {
+                0 => {
+                    // Writable and executable.
+                    bad[victim + 4..victim + 8]
+                        .copy_from_slice(&(PF_R | PF_W | PF_X).to_le_bytes());
+                    ElfError::WriteExecSegment
+                }
+                1 => {
+                    // File size larger than memory size.
+                    bad[victim + 32..victim + 40].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+                    ElfError::BadSegment
+                }
+                2 => {
+                    // Address range wraps around.
+                    bad[victim + 16..victim + 24].copy_from_slice(&(u64::MAX - 100).to_le_bytes());
+                    ElfError::BadSegment
+                }
+                3 => {
+                    // Entry point far outside the image.
+                    bad[24..32].copy_from_slice(&0xdead_0000_0000u64.to_le_bytes());
+                    ElfError::EntryNotExecutable
+                }
+                _ => {
+                    // Not for this machine.
+                    bad[18..20].copy_from_slice(&183u16.to_le_bytes());
+                    ElfError::WrongMachine
+                }
+            };
+            assert_eq!(parse(&bad, &lim()), Err(expected), "round {round}");
+        }
+    }
+
+    /// Long-running variant: `cargo test -p kalkan-core --release -- --ignored`.
+    #[test]
+    #[ignore = "stress test, takes a while without --release"]
+    fn random_mutations_never_panic_stress() {
+        let mut rng = XorShift::new(0x57e55);
+        for _ in 0..40_000 {
+            let (seed_image, _) = random_valid_image(&mut rng);
+            for _ in 0..50 {
+                let mut f = seed_image.clone();
+                for _ in 0..1 + rng.below(6) {
+                    let pos = rng.below(f.len().min(0x200) as u64) as usize;
+                    f[pos] = rng.next() as u8;
+                }
+                if let Ok(img) = parse(&f, &lim()) {
+                    for s in &img.segments {
+                        assert!(!(s.perms.write && s.perms.exec));
+                        assert!(s.file_offset + s.file_size <= f.len() as u64);
+                    }
+                }
+            }
+        }
+    }
 }

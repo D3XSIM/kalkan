@@ -4,7 +4,7 @@
 
 **x86-64 için Rust ile yazılmış, yetki (capability) tabanlı, güvenlik odaklı bir mikroçekirdek.**
 
-[English README](README.md) · [Mimari](docs/ARCHITECTURE.md) · [Tehdit modeli](docs/THREAT_MODEL.md) · [Sistem çağrıları](docs/SYSCALLS.md) · [Derleme](docs/BUILDING.md)
+[English README](README.md) · [Mimari](docs/ARCHITECTURE.md) · [Tehdit modeli](docs/THREAT_MODEL.md) · [Sistem çağrıları](docs/SYSCALLS.md) · [Testler](docs/TESTING.md) · [Derleme](docs/BUILDING.md)
 
 </div>
 
@@ -38,8 +38,16 @@ sandbox'tan kaçmaya çalıştığı saldırgan bir test paketiyle gelir.
   sabitlenmiş önyükleyici. Önyükleyici çekirdeği ve modülleri doğrular; çekirdek
   modülleri içine gömülü özetlerle **bir kez daha** doğrular. Kurcalama CI'da test
   edilir.
-- ⚔️ **Saldırgan test paketi** — Çekirdeğe aktif olarak saldıran bir süreç dahil 62
-  açılış zamanı güvenlik testi ve önyükleme bölümü kurcalama testi.
+- ⚔️ **Saldırgan test paketi** — 120 açılış zamanı güvenlik kontrolü: 62 kaçış
+  denemesi yapan bir sandbox, her biri tek bir donanım düzeyi saldırı deneyen
+  **47 sonda süreci** (çekirdek belleği, W^X, ayrıcalıklı komutlar, ring 0'a dönüş,
+  düşmanca yığın/bayraklar...) ve bir **sistem çağrısı fuzzer'ı**. Üç farklı bellek
+  boyutunda, ayrıca "korumasız işlemcide açılmama" ve önyükleme kurcalama
+  senaryolarıyla çalışır.
+- 🔍 **Çekirdek kendini denetler** — Yerleşik denetçi tüm referans sayaçlarını,
+  eşleme sayaçlarını, bütçeleri, kuyrukları ve sayfa tablosu girdilerini sıfırdan
+  yeniden hesaplar. Test derlemelerinde **her** tuzaktan (trap) sonra çalışır:
+  açılış başına yaklaşık 44.000 kez.
 - 📦 **Sıfır bağımlılık** — Çekirdekte ve politika çekirdeğinde üçüncü taraf crate
   yok.
 
@@ -56,7 +64,8 @@ rustup set default-host x86_64-pc-windows-gnu   # Visual Studio yoksa
 
 ```sh
 cargo xtask run             # her şeyi derle ve Kalkan'ı QEMU'da aç
-cargo xtask test            # güvenlik paketi + kurcalama testi (CI'ın çalıştırdığı)
+cargo xtask test            # tüm güvenlik senaryoları (CI'ın çalıştırdığı, ~2,5 dk)
+cargo xtask test --quick    # paket + bir kurcalama testi (~20 sn)
 cargo test -p kalkan-core   # politika çekirdeğinin birim/özellik testleri
 ```
 
@@ -75,7 +84,7 @@ Ayrıntılar: [docs/BUILDING.md](docs/BUILDING.md).
 | ret2usr | SMEP + SMAP, hiç kaldırılmaz (çekirdekte `stac` yok) |
 | Kod enjeksiyonu | Çekirdek imajı, fiziksel harita, heap, yığınlar ve kullanıcı programlarında W^X; W^X takma adlar (alias) üzerinden de çerçeve başına korunur |
 | Bozuk/kötü niyetli çalıştırılabilir | Katı, panik üretmeyen, fuzz edilen ELF doğrulayıcı |
-| Adres sızıntısı | KASLR, rastgele fiziksel harita, rastgele çekirdek yığın/heap/MMIO yerleşimi, kullanıcı ASLR, UMIP |
+| Adres sızıntısı | KASLR; çekirdek fiziksel bellek haritasını rastgele bir adrese taşır; rastgele çekirdek yığın/heap/MMIO yerleşimi; kullanıcı ASLR; UMIP — hepsi CI'da açılışlar arasında karşılaştırılır |
 | Spectre v1/v2, MDS, SWAPGS | Dalsız indeks kısıtlama, IBPB, VERW, `swapgs` sonrası `lfence`, girişte tüm yazmaçların sıfırlanması |
 | SYSRET açığı (CVE-2012-0217) | Çekirdek her zaman `iretq` ile döner |
 | SIMD durum sızıntısı (LazyFP) | Kullanıcıya x87/SSE/AVX kapalı |

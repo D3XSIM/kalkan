@@ -27,6 +27,7 @@ Every capability argument is a **slot index** in the caller's capability space.
 | 15 | `ep_call` | ep, m0, m1, m2, m3, cap | `WRITE` on ep (+`GRANT` on cap) | m0–m3 of the reply |
 | 16 | `ep_reply` | m0, m1, m2, m3 | one-shot reply right | — |
 | 17 | `random` | — | — | 64 bits from the kernel CSPRNG |
+| 18 | `kernel_stats` | console | `READ` on a console cap | free frames, heap bytes, capabilities, threads, frame objects, endpoints (diagnostics for the leak tests) |
 
 `cap = u64::MAX` (`NO_CAP`) means "no capability". Slot 0 is the null slot: it is
 always empty and is rejected as a destination (`EBADSLOT`).
@@ -49,7 +50,9 @@ always empty and is rejected as a destination (`EBADSLOT`).
 | 12 | `EMAPPED` | Address or frame capability already mapped |
 | 13 | `EWX` | Writable + executable mapping requested |
 
-A failing system call never changes kernel state.
+A failing system call never changes kernel state. Rights are checked before the
+object type, so a capability that is both of the wrong type and lacks the required
+right yields `EPERM`.
 
 ## IPC message flags (`r9` after `ep_recv`)
 
@@ -66,6 +69,6 @@ A failing system call never changes kernel state.
 | 1 | own VSpace | `rwxg` |
 | 2 | own thread | `rwxg` |
 | 3 | untyped budget (128 KiB) | `rwxg` |
-| 4 | debug console | `-w-g` |
+| 4 | debug console | `rw-g` |
 | 5 | sandbox thread (not started) | `rwxg` |
 | 6 | sandbox VSpace | `rwxg` |

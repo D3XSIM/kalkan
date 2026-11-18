@@ -17,6 +17,9 @@ bench = false
 # Exit QEMU through the `isa-debug-exit` device when the root task terminates.
 # Only enabled by `cargo xtask test`; never enable on real hardware.
 qemu-exit = []
+# Re-verify the complete kernel object graph after every trap (see
+# `src/kernel/audit.rs`). Enabled by `cargo xtask test`.
+audit = []
 
 [dependencies]
 kcore = { package = "kalkan-core", path = "../kcore" }

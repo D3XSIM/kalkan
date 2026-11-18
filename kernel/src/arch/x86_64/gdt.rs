@@ -66,13 +66,19 @@ static GDT: Racy<Gdt> = Racy::new(Gdt([
 
 /// Early IST stacks used until the guarded stacks are mapped.
 #[repr(C, align(16))]
-struct EarlyStacks([[u8; 8192]; 3]);
-static EARLY_IST: Racy<EarlyStacks> = Racy::new(EarlyStacks([[0; 8192]; 3]));
+struct EarlyStacks([[u8; 8192]; IST_COUNT]);
+static EARLY_IST: Racy<EarlyStacks> = Racy::new(EarlyStacks([[0; 8192]; IST_COUNT]));
 
 /// IST index (1-based, as stored in IDT entries) for each critical exception.
 pub const IST_DOUBLE_FAULT: u8 = 1;
 pub const IST_NMI: u8 = 2;
 pub const IST_MACHINE_CHECK: u8 = 3;
+/// `#DB` gets its own stack too: it is the one exception that could, in principle,
+/// be delivered at the very first instruction of the system call entry point,
+/// where `rsp` still holds a user-controlled value (cf. CVE-2018-8897).
+pub const IST_DEBUG: u8 = 4;
+/// Number of interrupt stacks.
+pub const IST_COUNT: usize = 4;
 
 /// Loads the GDT and TSS and reloads every segment register.
 pub fn init() {
@@ -93,7 +99,7 @@ pub fn init() {
         gdt.0[6] = high;
         let tss = &mut *TSS.get();
         let mut ist = tss.ist;
-        for (i, slot) in ist.iter_mut().take(3).enumerate() {
+        for (i, slot) in ist.iter_mut().take(IST_COUNT).enumerate() {
             *slot = early + (i as u64 + 1) * 8192;
         }
         tss.ist = ist;
@@ -121,6 +127,9 @@ pub fn init() {
             "xor {tmp:e}, {tmp:e}",
             "mov fs, {tmp:x}",
             "mov gs, {tmp:x}",
+            // No local descriptor table: user code can never install descriptors
+            // (call gates, 32-bit code segments) of its own.
+            "lldt {tmp:x}",
             "ltr {tss:x}",
             ptr = in(reg) &ptr,
             cs = in(reg) u64::from(KERNEL_CS),
@@ -139,12 +148,12 @@ pub fn set_kernel_stack(top: u64) {
 }
 
 /// Installs the guarded interrupt stacks (`tops[i]` for IST `i + 1`).
-pub fn set_interrupt_stacks(tops: [u64; 3]) {
+pub fn set_interrupt_stacks(tops: [u64; IST_COUNT]) {
     // SAFETY: as above.
     unsafe {
         let tss = &mut *TSS.get();
         let mut ist = tss.ist;
-        ist[..3].copy_from_slice(&tops);
+        ist[..IST_COUNT].copy_from_slice(&tops);
         tss.ist = ist;
     }
 }

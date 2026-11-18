@@ -38,6 +38,12 @@ pub fn init(kernel_stack_top: u64) {
         msr::write(msr::IA32_LSTAR, syscall_entry_address());
         msr::write(msr::IA32_CSTAR, 0);
         msr::write(msr::IA32_FMASK, FMASK);
+        // `sysenter` is not a supported entry path. With a zero SYSENTER_CS the
+        // instruction faults instead of jumping to whatever the firmware left in
+        // these registers with ring 0 privileges.
+        msr::write(msr::IA32_SYSENTER_CS, 0);
+        msr::write(msr::IA32_SYSENTER_ESP, 0);
+        msr::write(msr::IA32_SYSENTER_EIP, 0);
         msr::write(msr::IA32_FS_BASE, 0);
         msr::write(msr::IA32_GS_BASE, PERCPU.get() as u64);
         msr::write(msr::IA32_KERNEL_GS_BASE, 0);

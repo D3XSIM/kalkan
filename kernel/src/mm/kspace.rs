@@ -23,10 +23,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::chacha20::ChaChaRng;
 
 use super::paging::{self, MapError, PageSize, flags::*};
-use super::{MemoryMap, PAGE_SIZE, frame, hhdm};
+use super::{MemoryMap, PAGE_SIZE, frame, set_hhdm};
 use crate::arch;
 
 const SIZE_2M: u64 = 2 << 20;
+const SIZE_1G: u64 = 1 << 30;
+const SLOT_SIZE: u64 = 1 << 39;
 const STACK_PAGES: u64 = 16;
 const IST_PAGES: u64 = 4;
 /// Virtual size reserved for the kernel heap.
@@ -34,6 +36,10 @@ pub const HEAP_SIZE: u64 = 64 << 30;
 
 static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 static KERNEL_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+/// Base of the kernel's own direct map (takes effect in [`enter`]).
+static DIRECT_MAP: AtomicU64 = AtomicU64::new(0);
+/// The function [`enter`] continues with on the new stack.
+static CONTINUATION: AtomicU64 = AtomicU64::new(0);
 
 /// Physical address of the kernel's PML4.
 #[must_use]
@@ -52,10 +58,11 @@ pub struct Layout {
     pub data: (u64, u64),
     pub stack_top: u64,
     pub stack_guard: u64,
-    pub ist_tops: [u64; 3],
+    pub ist_tops: [u64; arch::gdt::IST_COUNT],
     pub heap_base: u64,
     pub lapic_virt: u64,
-    pub hhdm_slots: (usize, usize),
+    /// Base of the kernel's direct map of physical memory.
+    pub direct_map: u64,
     pub slots: [usize; 3],
 }
 
@@ -139,14 +146,34 @@ pub fn build(map: &MemoryMap, lapic_phys: u64, rng: &mut ChaChaRng) -> Layout {
     // 1. Direct map of RAM: read-write, never executable. The kernel image's own
     //    frames are mapped read-only there, so the alias cannot be used to modify
     //    kernel code or read-only data.
-    let hhdm = hhdm();
-    let mut lo = usize::MAX;
-    let mut hi = 0;
+    //
+    //    The bootloader's direct map sits at a predictable address, so the kernel
+    //    does not keep it: it builds its own at a random top-level slot and a
+    //    random 1 GiB-aligned offset, and switches to it in `enter`.
+    let image_slot = (text.0 >> 39 & 511) as usize;
+    let top = map
+        .iter()
+        .filter(|r| r.kind.direct_mapped())
+        .map(|r| r.base + r.len)
+        .max()
+        .expect("no memory to map")
+        .next_multiple_of(SIZE_1G);
+    let span_slots = top.div_ceil(SLOT_SIZE) as usize;
+    assert!(span_slots < 128, "physical address space too large");
+    // First slot: anywhere in the kernel half that keeps clear of the image slot.
+    let lo = 256 + rng.below((255 - span_slots) as u64 + 1) as usize;
+    let hi = lo + span_slots - 1;
+    debug_assert!(hi < image_slot);
+    let offset = if span_slots == 1 {
+        rng.below((SLOT_SIZE - top) / SIZE_1G + 1) * SIZE_1G
+    } else {
+        0
+    };
+    let hhdm = slot_base(lo) + offset;
+    layout.direct_map = hhdm;
     for r in map.iter().filter(|r| r.kind.direct_mapped()) {
         let mut pa = r.base & !(PAGE_SIZE - 1);
         let end = (r.base + r.len).next_multiple_of(PAGE_SIZE);
-        lo = lo.min(((hhdm + pa) >> 39 & 511) as usize);
-        hi = hi.max(((hhdm + end - 1) >> 39 & 511) as usize);
         while pa < end {
             let use_2m = pa.is_multiple_of(SIZE_2M)
                 && end - pa >= SIZE_2M
@@ -174,7 +201,6 @@ pub fn build(map: &MemoryMap, lapic_phys: u64, rng: &mut ChaChaRng) -> Layout {
             }
         }
     }
-    layout.hhdm_slots = (lo, hi);
 
     // 2. Kernel image with strict W^X.
     map_image_range(pml4, boot_pml4, text.0, text.1, 0);
@@ -185,7 +211,6 @@ pub fn build(map: &MemoryMap, lapic_phys: u64, rng: &mut ChaChaRng) -> Layout {
     layout.data = data;
     layout.kernel_virt = text.0;
     layout.kernel_phys = paging::translate(boot_pml4, text.0).map_or(0, |t| t.phys);
-    let image_slot = (text.0 >> 39 & 511) as usize;
 
     // 3. Pick three distinct random top-level slots for stack, heap and MMIO.
     let mut slots = [0usize; 3];
@@ -204,7 +229,7 @@ pub fn build(map: &MemoryMap, lapic_phys: u64, rng: &mut ChaChaRng) -> Layout {
     let random_offset = |rng: &mut ChaChaRng| rng.below(1 << 17) * SIZE_2M; // within 256 GiB
 
     // 4. Kernel stack and IST stacks, separated by unmapped guard pages:
-    //    [guard][stack x16][guard][ist1 x4][guard][ist2 x4][guard][ist3 x4][guard]
+    //    [guard][stack x16][guard][ist1 x4][guard][ist2 x4][guard] ... [istN x4][guard]
     let stack_region = slot_base(slots[0]) + random_offset(rng);
     layout.stack_guard = stack_region;
     let stack_base = stack_region + PAGE_SIZE;
@@ -235,6 +260,7 @@ pub fn build(map: &MemoryMap, lapic_phys: u64, rng: &mut ChaChaRng) -> Layout {
     .expect("map local APIC");
 
     KERNEL_PML4.store(pml4, Ordering::Relaxed);
+    DIRECT_MAP.store(layout.direct_map, Ordering::Relaxed);
     KERNEL_STACK_TOP.store(layout.stack_top, Ordering::Relaxed);
     layout
 }
@@ -265,8 +291,23 @@ pub fn unmap_heap_page(vaddr: u64) {
     }
 }
 
+/// First code that runs on the kernel's own page tables and stack.
+extern "C" fn landed() -> ! {
+    // The bootloader's direct map is gone: from here on physical memory is
+    // reached through the kernel's own, randomly placed direct map.
+    set_hhdm(DIRECT_MAP.load(Ordering::Relaxed));
+    frame::rebase();
+    let next = CONTINUATION.load(Ordering::Relaxed) as usize;
+    // SAFETY: `enter` stored a valid `extern "C" fn() -> !` in `CONTINUATION`.
+    let next: extern "C" fn() -> ! = unsafe { core::mem::transmute(next) };
+    next()
+}
+
 /// Activates the page tables built by [`build`] and continues in `next` on the
 /// kernel's guard-paged stack. Never returns.
+///
+/// Nothing that was reached through the bootloader's direct map (boot protocol
+/// structures, module data) may be used afterwards without translating it again.
 pub fn enter(next: extern "C" fn() -> !) -> ! {
     let pml4 = kernel_pml4();
     let stack_top = KERNEL_STACK_TOP.load(Ordering::Relaxed);
@@ -274,8 +315,10 @@ pub fn enter(next: extern "C" fn() -> !) -> ! {
         pml4 != 0 && stack_top != 0,
         "kernel address space not built"
     );
-    // SAFETY: `build` created this PML4 with the kernel image, the direct map
-    // (including the bootloader stack and all boot data) and the kernel stack
-    // ending at `stack_top`; `next` never returns.
-    unsafe { arch::entry::switch_to_kernel_space(pml4, stack_top, next) }
+    CONTINUATION.store(next as usize as u64, Ordering::Relaxed);
+    // SAFETY: `build` created this PML4 with the kernel image, the kernel's own
+    // direct map and the kernel stack ending at `stack_top`. `landed` only uses
+    // statics in the kernel image until it has switched the direct map over, and
+    // never returns.
+    unsafe { arch::entry::switch_to_kernel_space(pml4, stack_top, landed) }
 }

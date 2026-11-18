@@ -64,4 +64,20 @@ mod tests {
         assert_eq!(clamp(4, 4), None);
         assert_eq!(clamp(u64::MAX, 4), None);
     }
+
+    #[test]
+    fn random_values_match_the_plain_comparison() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let len = (x % 5000) as usize + 1;
+            let index = match x >> 60 {
+                0..=7 => (x >> 16) as usize % (2 * len), // near the boundary
+                _ => (x >> 8) as usize,                  // anywhere
+            };
+            assert_eq!(clamp(index as u64, len), (index < len).then_some(index));
+        }
+    }
 }

@@ -11,13 +11,16 @@
 //! disabled, under one lock, and ends by selecting the thread to resume. Blocking
 //! operations never block *in the kernel*; they only change thread states.
 
+mod audit;
 mod ipc;
 pub mod loader;
 pub mod object;
 mod syscall;
 
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use kcore::abi;
 use kcore::arena::Arena;
@@ -53,6 +56,7 @@ pub struct Stats {
     pub preemptions: u64,
     pub context_switches: u64,
     pub ipc_messages: u64,
+    pub audits: u64,
 }
 
 /// What to do after handling a trap.
@@ -185,6 +189,13 @@ impl Kernel {
         };
         // Every thread still waiting on the endpoint is woken with EDEAD.
         for t in ep.senders.into_iter().chain(ep.receivers) {
+            // Only threads that really are blocked on this endpoint are touched.
+            let blocked = self.threads.get(t).is_some_and(|th| {
+                matches!(th.state, ThreadState::BlockedSend(e) | ThreadState::BlockedRecv(e) if e == id)
+            });
+            if !blocked {
+                continue;
+            }
             let fault = self.threads.get(t).is_some_and(|th| th.outgoing.fault);
             if fault {
                 self.finish_thread(t);
@@ -330,6 +341,20 @@ impl Kernel {
     // --------------------------------------------------------------- scheduling
 
     fn handle_trap(&mut self, frame: &mut TrapFrame) -> Next {
+        let next = self.handle_trap_inner(frame);
+        // With the `audit` feature the complete object graph is re-verified after
+        // every single trap.
+        #[cfg(feature = "audit")]
+        if matches!(next, Next::Resume) {
+            self.stats.audits += 1;
+            if let Err(e) = self.audit(true) {
+                panic!("kernel audit failed: {e}");
+            }
+        }
+        next
+    }
+
+    fn handle_trap_inner(&mut self, frame: &mut TrapFrame) -> Next {
         let Some(cur) = self.current else {
             panic!("user trap without a current thread");
         };
@@ -409,7 +434,9 @@ impl Kernel {
         Next::Resume
     }
 
-    fn print_stats(&self) {
+    /// Prints the final statistics and audits the object graph one last time.
+    /// Returns `false` if the audit found an inconsistency.
+    fn print_stats(&self) -> bool {
         let s = self.stats;
         let (free, total) = mm::frame::stats();
         kprintln!(
@@ -429,6 +456,26 @@ impl Kernel {
             mm::heap::allocated(),
             self.caps.len()
         );
+        match self.audit(false) {
+            Ok(c) => {
+                kprintln!(
+                    "[kernel] audit: object graph consistent ({} capabilities, {} threads, \
+                     {} endpoints, {} frames, {} mappings, {} address spaces); {} audits passed",
+                    c.capabilities,
+                    c.threads,
+                    c.endpoints,
+                    c.frames,
+                    c.mappings,
+                    c.vspaces,
+                    s.audits + 1
+                );
+                true
+            }
+            Err(e) => {
+                kprintln!("[kernel] AUDIT FAILED: {e}");
+                false
+            }
+        }
     }
 }
 
@@ -437,11 +484,10 @@ pub fn user_trap(frame: &mut TrapFrame) {
     let next = {
         let mut guard = KERNEL.lock();
         let k = guard.as_mut().expect("kernel not initialised");
-        let next = k.handle_trap(frame);
-        if let Next::Shutdown(_) = next {
-            k.print_stats();
+        match k.handle_trap(frame) {
+            Next::Shutdown(ok) => Next::Shutdown(k.print_stats() && ok),
+            next => next,
         }
-        next
     };
     if let Next::Shutdown(success) = next {
         if success {
@@ -464,47 +510,79 @@ pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])]) {
             .unwrap_or_else(|| panic!("boot module '{name}' missing"))
     };
 
+    let describe = |name: &str, p: &loader::Spawned| {
+        kprintln!(
+            "[loader] '{}': {} segments, {} relocations, base {:#x}, entry {:#x}, stack top {:#x}",
+            name,
+            p.segments,
+            p.relocations,
+            p.base,
+            p.entry,
+            p.stack_top
+        );
+    };
     let init = loader::spawn(&mut k, "init", image("init")).expect("failed to load init");
+    describe("init", &init);
     let sandbox =
         loader::spawn(&mut k, "sandbox", image("sandbox")).expect("failed to load sandbox");
+    describe("sandbox", &sandbox);
+    // Probe processes: further instances of the (untrusted) sandbox image, each
+    // with its own address space, capability space and ASLR layout.
+    let probes: Vec<loader::Spawned> = (0..abi::PROBE_COUNT)
+        .map(|i| {
+            loader::spawn(&mut k, &format!("probe{i:02}"), image("sandbox"))
+                .expect("failed to load a probe process")
+        })
+        .collect();
 
     let untyped = k
         .untypeds
         .insert(Untyped {
+            total: limits::ROOT_UNTYPED_BYTES,
             remaining: limits::ROOT_UNTYPED_BYTES,
             refs: 0,
         })
         .expect("untyped");
     let cspace = k.threads.get(init.thread).expect("init").cspace;
-    let initial = [
+    let console_rights = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
+    let mut initial = alloc::vec![
         (
             abi::slot::SELF_VSPACE,
             Object::VSpace(init.vspace),
-            Rights::ALL,
+            Rights::ALL
         ),
         (
             abi::slot::SELF_THREAD,
             Object::Thread(init.thread),
-            Rights::ALL,
+            Rights::ALL
         ),
         (abi::slot::UNTYPED, Object::Untyped(untyped), Rights::ALL),
-        (
-            abi::slot::CONSOLE,
-            Object::Console,
-            Rights::WRITE.union(Rights::GRANT),
-        ),
+        (abi::slot::CONSOLE, Object::Console, console_rights),
         (
             abi::slot::SANDBOX_THREAD,
             Object::Thread(sandbox.thread),
-            Rights::ALL,
+            Rights::ALL
         ),
         (
             abi::slot::SANDBOX_VSPACE,
             Object::VSpace(sandbox.vspace),
-            Rights::ALL,
+            Rights::ALL
         ),
     ];
-    for (slot, object, rights) in initial {
+    for (i, p) in probes.iter().enumerate() {
+        let i = i as u64;
+        initial.push((
+            abi::slot::PROBE_THREAD_FIRST + i,
+            Object::Thread(p.thread),
+            Rights::ALL,
+        ));
+        initial.push((
+            abi::slot::PROBE_VSPACE_FIRST + i,
+            Object::VSpace(p.vspace),
+            Rights::ALL,
+        ));
+    }
+    for &(slot, object, rights) in &initial {
         k.caps
             .insert_root(
                 cspace,
@@ -524,9 +602,13 @@ pub fn init(rng: ChaChaRng, modules: &[(&str, &[u8])]) {
 
     k.root = Some(init.thread);
     k.make_ready(init.thread);
+    k.audit(false)
+        .expect("initial kernel state is inconsistent");
     kprintln!(
-        "[kernel] root task 'init' ready with {} initial capabilities; 'sandbox' created (inactive)",
-        initial.len()
+        "[kernel] root task 'init' ready with {} initial capabilities; 'sandbox' and {} probe \
+         processes created (inactive)",
+        initial.len(),
+        probes.len()
     );
     *KERNEL.lock() = Some(k);
 }

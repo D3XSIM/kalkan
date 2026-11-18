@@ -116,14 +116,22 @@ impl AddressSpace {
             *tables += 1;
             Some(t)
         };
-        paging::map(
+        let result = paging::map(
             self.pml4,
             vaddr,
             phys,
             perms.leaf_flags(),
             PageSize::Size4K,
             &mut alloc_table,
-        )
+        );
+        if result.is_err() {
+            // Roll back: a failed mapping must not leave empty tables behind.
+            paging::prune_user(self.pml4, vaddr, &mut |t| {
+                frame::free(t);
+                *tables -= 1;
+            });
+        }
+        result
     }
 
     /// Unmaps one user page and returns the frame that was mapped there.

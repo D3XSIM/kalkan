@@ -11,7 +11,7 @@
 
 use core::fmt::Display;
 
-use libkalkan::selftest::{self, slot as sb};
+use libkalkan::selftest::{self, Expect, mode, slot as sb, vector};
 use libkalkan::{self as k, Error, Rights, abi, abi::slot, println};
 
 // Slots used by the root task.
@@ -29,8 +29,14 @@ const RECV: u64 = slot::FIRST_FREE + 10;
 const SUB_UNTYPED: u64 = slot::FIRST_FREE + 11;
 const ALIAS_A: u64 = slot::FIRST_FREE + 12;
 const ALIAS_B: u64 = slot::FIRST_FREE + 13;
+const PROBE_FAULT: u64 = slot::FIRST_FREE + 14;
+const FUZZ_FRAME: u64 = slot::FIRST_FREE + 15;
 const QUOTA_FIRST: u64 = 24;
 const QUOTA_LAST: u64 = 63;
+// Slots above the probe capabilities.
+const PAGE_A: u64 = 200;
+const PAGE_B: u64 = 201;
+const LEAK: u64 = 204;
 
 // Virtual addresses for test mappings.
 const VA_FRAME: u64 = 0x0000_5000_0000_0000;
@@ -38,6 +44,8 @@ const VA_FRAME_RO: u64 = 0x0000_5000_0001_0000;
 const VA_SHARED: u64 = 0x0000_5000_0002_0000;
 const VA_ALIAS_W: u64 = 0x0000_5000_0003_0000;
 const VA_ALIAS_X: u64 = 0x0000_5000_0004_0000;
+const VA_PAIR: u64 = 0x0000_5000_0010_0000;
+const VA_LEAK: u64 = 0x0000_3000_0000_0000;
 const KERNEL_ADDR: u64 = 0xffff_8000_0000_0000;
 
 struct Suite {
@@ -424,6 +432,136 @@ fn quota_tests(s: &mut Suite) {
     let _ = k::cap_delete(SUB_UNTYPED);
 }
 
+/// Copies from user memory across page boundaries.
+fn copy_tests(s: &mut Suite) {
+    section("user memory copies");
+    let rw = Rights::READ.union(Rights::WRITE);
+    let text = b"KALKAN-CROSS-PAGE-COPY-OK";
+    let start = VA_PAIR + 4096 - 12;
+    let mapped = k::retype(slot::UNTYPED, abi::obj::FRAME, PAGE_A).is_ok()
+        && k::retype(slot::UNTYPED, abi::obj::FRAME, PAGE_B).is_ok()
+        && k::vspace_map(slot::SELF_VSPACE, PAGE_A, VA_PAIR, rw).is_ok()
+        && k::vspace_map(slot::SELF_VSPACE, PAGE_B, VA_PAIR + 4096, rw).is_ok();
+    if !mapped {
+        s.check("map two adjacent pages", false, "setup failed");
+        return;
+    }
+    // SAFETY: both pages were just mapped read-write; the text spans the boundary.
+    unsafe { core::ptr::copy_nonoverlapping(text.as_ptr(), start as *mut u8, text.len()) };
+    let write = |len: usize| {
+        // SAFETY: debug_write only reads; the kernel validates the range.
+        unsafe {
+            k::syscall(
+                abi::sys::DEBUG_WRITE,
+                [slot::CONSOLE, start, len as u64, 0, 0, 0],
+            )
+        }
+        .status()
+    };
+    s.expect_ok(
+        "copy a buffer that crosses a page boundary",
+        write(text.len()),
+    );
+    // Remove the second page: the same buffer must now be refused as a whole.
+    let _ = k::cap_delete(PAGE_B);
+    s.expect_err(
+        "buffer whose second page was unmapped",
+        write(text.len()),
+        Error::BadAddress,
+    );
+    s.expect_ok(
+        "the part on the remaining page is still readable",
+        write(12),
+    );
+    let _ = k::cap_delete(PAGE_A);
+    s.expect_err(
+        "buffer on fully unmapped pages",
+        write(12),
+        Error::BadAddress,
+    );
+}
+
+/// Kernel memory and object leaks, measured from the kernel's own counters.
+fn leak_tests(s: &mut Suite) {
+    section("kernel resource leaks");
+    let rw = Rights::READ.union(Rights::WRITE);
+    let cycle = |round: u64| {
+        // A frame: create, map sparsely, alias through derived capabilities, revoke.
+        let _ = k::retype(slot::UNTYPED, abi::obj::FRAME, LEAK);
+        let _ = k::vspace_map(slot::SELF_VSPACE, LEAK, (round % 5 + 1) << 39, rw);
+        for i in 1..4 {
+            let _ = k::cap_mint(LEAK, LEAK + i, Rights::READ, 0);
+            let _ = k::vspace_map(
+                slot::SELF_VSPACE,
+                LEAK + i,
+                VA_LEAK + (i << 30),
+                Rights::READ,
+            );
+        }
+        let _ = k::cap_revoke(LEAK);
+        let _ = k::cap_delete(LEAK);
+        // An endpoint with badged copies.
+        let _ = k::retype(slot::UNTYPED, abi::obj::ENDPOINT, LEAK);
+        let _ = k::cap_mint(LEAK, LEAK + 1, Rights::WRITE, round + 1);
+        let _ = k::cap_mint(LEAK + 1, LEAK + 2, Rights::WRITE, 0);
+        let _ = k::cap_delete(LEAK + 1);
+        let _ = k::cap_delete(LEAK);
+        let _ = k::cap_delete(LEAK + 2);
+        // A delegated budget that is revoked together with what it paid for.
+        let _ = k::cap_mint(slot::UNTYPED, LEAK, Rights::WRITE, 0);
+        let _ = k::retype(LEAK, abi::obj::FRAME, LEAK + 1);
+        let _ = k::retype(LEAK, abi::obj::ENDPOINT, LEAK + 2);
+        let _ = k::vspace_map(slot::SELF_VSPACE, LEAK + 1, VA_LEAK, rw);
+        let _ = k::cap_revoke(LEAK);
+        let _ = k::cap_delete(LEAK);
+        // Failed operations must not leave anything behind either.
+        let _ = k::retype(slot::UNTYPED, abi::obj::FRAME, slot::CONSOLE);
+        let _ = k::retype(slot::UNTYPED, 99, LEAK);
+        let _ = k::vspace_map(slot::SELF_VSPACE, LEAK, VA_LEAK, rw);
+    };
+    for round in 0..8 {
+        cycle(round); // warm up: let the kernel's tables reach their steady size
+    }
+    let before = k::kernel_stats(slot::CONSOLE).ok();
+    for round in 0..400 {
+        cycle(round);
+    }
+    let after = k::kernel_stats(slot::CONSOLE).ok();
+    s.check(
+        "400 object life cycles leave no kernel memory or objects behind",
+        no_growth(before, after),
+        format_args!("{}", StatsLine(after.unwrap_or_default())),
+    );
+}
+
+/// `true` if the kernel uses no more resources in `after` than in `before`.
+fn no_growth(before: Option<k::KernelStats>, after: Option<k::KernelStats>) -> bool {
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            a.free_frames >= b.free_frames
+                && a.heap_bytes <= b.heap_bytes
+                && a.capabilities == b.capabilities
+                && a.threads == b.threads
+                && a.frames == b.frames
+                && a.endpoints == b.endpoints
+        }
+        _ => false,
+    }
+}
+
+struct StatsLine(k::KernelStats);
+
+impl Display for StatsLine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = &self.0;
+        write!(
+            f,
+            "{} frames free, {} heap bytes, {} capabilities, {} threads",
+            s.free_frames, s.heap_bytes, s.capabilities, s.threads
+        )
+    }
+}
+
 /// Grants the sandbox exactly the capabilities it needs — and nothing else.
 fn setup_sandbox(s: &mut Suite) -> bool {
     section("least-privilege sandbox setup");
@@ -441,9 +579,12 @@ fn setup_sandbox(s: &mut Suite) -> bool {
         s.check("create endpoint and shared frame", false, "setup failed");
         return false;
     }
-    // SAFETY: VA_SHARED was just mapped read-write.
+    // SAFETY: VA_SHARED was just mapped read-write and is one page long.
     unsafe {
-        core::ptr::copy_nonoverlapping(selftest::SHARED_SECRET.as_ptr(), VA_SHARED as *mut u8, 20);
+        let page = core::slice::from_raw_parts_mut(VA_SHARED as *mut u8, 4096);
+        page.fill(b'.');
+        page[..20].copy_from_slice(selftest::SHARED_SECRET);
+        page[4096 - 16..].copy_from_slice(b"end-of-the-page!");
     }
     let t = slot::SANDBOX_THREAD;
     s.expect_err(
@@ -485,6 +626,11 @@ fn setup_sandbox(s: &mut Suite) -> bool {
         let r = k::thread_grant(t, src, dst, rights, badge);
         s.check(what, r.is_ok(), format_args!("slot {dst}, rights {rights}"));
     }
+    s.expect_err(
+        "granting into the null slot",
+        k::thread_grant(t, slot::CONSOLE, abi::slot::NULL, Rights::WRITE, 0),
+        Error::BadSlot,
+    );
     s.expect_ok(
         "route sandbox faults to the root task",
         k::thread_set_fault_ep(t, FAULT_EP),
@@ -498,70 +644,266 @@ fn setup_sandbox(s: &mut Suite) -> bool {
     true
 }
 
-/// Serves the sandbox until the kernel reports that it was killed.
-fn serve_sandbox(s: &mut Suite) {
-    let mut sandbox_passed = 0;
-    let mut sandbox_failed = 0;
-    let mut wrong_badge = false;
+/// What a supervised process did before it ended.
+#[derive(Default)]
+struct Served {
+    passed: u32,
+    failed: u32,
+    wrong_badge: bool,
+    marks: [Option<k::KernelStats>; 4],
+    /// The kernel's final report: `[vector, error, address, rip]` for a fault,
+    /// `[EXIT_VECTOR, code, 0, 0]` for an exit.
+    end: [u64; 4],
+}
+
+/// Serves one supervised process until the kernel reports that it is gone.
+///
+/// With `noise` the process is a fuzzer: its messages are answered but their
+/// contents mean nothing.
+fn serve(
+    client_badge: u64,
+    fault_badge: u64,
+    mode: u64,
+    argument: u64,
+    noise: bool,
+) -> Option<Served> {
+    let mut served = Served::default();
     loop {
-        let msg = match k::recv(ENDPOINT, Some(RECV)) {
-            Ok(m) => m,
-            Err(e) => {
-                s.check("receive from the sandbox", false, e.name());
-                return;
-            }
-        };
+        let msg = k::recv(ENDPOINT, Some(RECV)).ok()?;
         if msg.is_fault() {
-            section("sandbox containment");
-            s.check(
-                "fault report carries the unforgeable fault badge",
-                msg.badge == selftest::FAULT_BADGE,
-                format_args!("badge {:#x}", msg.badge),
-            );
-            s.check(
-                "sandbox killed on its kernel memory access",
-                msg.words[0] == 14 && msg.words[2] >= 0xffff_8000_0000_0000,
-                format_args!("page fault at {:#x}", msg.words[2]),
-            );
-            break;
+            if msg.badge == fault_badge {
+                served.end = msg.words;
+                return Some(served);
+            }
+            served.wrong_badge = true;
+            continue;
         }
-        if msg.badge != selftest::CLIENT_BADGE {
-            wrong_badge = true;
+        if msg.badge != client_badge {
+            served.wrong_badge = true;
         }
         let reply = match msg.words[0] {
+            selftest::HELLO => [mode, argument, 0, 0],
+            _ if noise => [u64::MAX; 4],
             selftest::REPORT => {
                 if msg.words[2] == 1 {
-                    sandbox_passed += 1
+                    served.passed += 1;
                 } else {
-                    sandbox_failed += 1
+                    served.failed += 1;
                 }
                 [0; 4]
             }
-            selftest::TRANSFER => {
-                if msg.info & abi::msg::CAP_TRANSFERRED != 0 {
-                    let _ = k::cap_delete(RECV);
+            selftest::TRANSFER => [msg.info, 0, 0, 0],
+            selftest::MARK => {
+                if let Some(mark) = served.marks.get_mut(msg.words[1] as usize) {
+                    *mark = k::kernel_stats(slot::CONSOLE).ok();
                 }
-                [msg.info, 0, 0, 0]
+                [0; 4]
             }
             selftest::DONE => [0; 4],
             _ => [u64::MAX; 4],
         };
+        if msg.info & abi::msg::CAP_TRANSFERRED != 0 {
+            let _ = k::cap_delete(RECV);
+        }
         let _ = k::reply(reply);
     }
+}
+
+/// Runs the main sandbox and checks everything it reported.
+fn run_sandbox(s: &mut Suite) {
+    let Some(served) = serve(
+        selftest::CLIENT_BADGE,
+        selftest::FAULT_BADGE,
+        mode::MAIN,
+        0,
+        false,
+    ) else {
+        s.check("serve the sandbox", false, "receive failed");
+        return;
+    };
+    section("sandbox containment");
+    let [vector, _, address, _] = served.end;
+    s.check(
+        "sandbox killed on its kernel memory access",
+        vector == vector::PAGE_FAULT && address >= 0xffff_8000_0000_0000,
+        format_args!("page fault at {address:#x}, reported with the fault badge"),
+    );
     s.check(
         "every message carried the client's badge",
-        !wrong_badge,
+        !served.wrong_badge,
         "clients cannot forge identity",
     );
     s.check(
         "sandbox escape attempts all refused",
-        sandbox_failed == 0 && sandbox_passed > 0,
-        format_args!("{sandbox_passed} checks passed, {sandbox_failed} failed"),
+        served.failed == 0 && served.passed > 0,
+        format_args!("{} checks passed, {} failed", served.passed, served.failed),
+    );
+    let [_, m1, m2, m3] = served.marks;
+    s.check(
+        "2000 map/unmap cycles by the sandbox leak nothing",
+        no_growth(m1, m2),
+        format_args!("{}", StatsLine(m2.unwrap_or_default())),
+    );
+    s.check(
+        "hitting the page-table quota leaks nothing",
+        no_growth(m1, m3),
+        format_args!("{}", StatsLine(m3.unwrap_or_default())),
     );
     s.expect_err(
         "killed thread cannot be restarted",
         k::thread_start(slot::SANDBOX_THREAD),
         Error::Dead,
+    );
+    // Dropping the last capability to the dead sandbox's address space returns
+    // its memory to the kernel.
+    let before = k::kernel_stats(slot::CONSOLE).unwrap_or_default();
+    let _ = k::cap_delete(slot::SANDBOX_VSPACE);
+    let _ = k::cap_delete(slot::SANDBOX_THREAD);
+    let after = k::kernel_stats(slot::CONSOLE).unwrap_or_default();
+    s.check(
+        "the dead sandbox's memory is reclaimed",
+        after.free_frames > before.free_frames + 16,
+        format_args!(
+            "{} frames returned",
+            after.free_frames.saturating_sub(before.free_frames)
+        ),
+    );
+}
+
+/// How a probe process ended, for the log.
+struct Outcome([u64; 4]);
+
+impl Display for Outcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let [vector, error, address, _] = self.0;
+        match vector {
+            abi::EXIT_VECTOR if error == selftest::EXIT_NOT_APPLICABLE => {
+                f.write_str("not applicable: the CPU lacks the feature")
+            }
+            abi::EXIT_VECTOR if error == selftest::EXIT_ESCAPED => f.write_str("NOT STOPPED"),
+            abi::EXIT_VECTOR => write!(f, "exited with {error:#x}"),
+            vector::PAGE_FAULT => write!(f, "killed: page fault at {address:#x}, error {error:#x}"),
+            vector::GENERAL_PROTECTION => f.write_str("killed: general protection fault"),
+            vector::INVALID_OPCODE => f.write_str("killed: invalid opcode"),
+            vector::DEVICE_NOT_AVAILABLE => f.write_str("killed: device not available"),
+            vector::DIVIDE_ERROR => f.write_str("killed: divide error"),
+            vector::DEBUG => f.write_str("killed: debug trap"),
+            other => write!(f, "killed: exception {other}"),
+        }
+    }
+}
+
+/// Starts one probe process per attack and checks that each ends exactly as it
+/// must — and that the kernel gets all of its resources back.
+fn run_probes(s: &mut Suite) {
+    section("fault containment: one process per attack");
+    let rwx = Rights::READ.union(Rights::WRITE).union(Rights::EXEC);
+    let (mut min_freed, mut max_freed) = (u64::MAX, 0);
+    let mut clean = true;
+    for (i, probe) in selftest::PROBES.iter().enumerate() {
+        let i = i as u64;
+        let thread = slot::PROBE_THREAD_FIRST + i;
+        let (client, fault) = (
+            selftest::PROBE_CLIENT_BADGE + i,
+            selftest::PROBE_FAULT_BADGE + i,
+        );
+        let before = k::kernel_stats(slot::CONSOLE).unwrap_or_default();
+
+        let mut ready = k::thread_grant(thread, ENDPOINT, sb::ENDPOINT, Rights::WRITE, client)
+            .is_ok()
+            && k::thread_grant(thread, slot::CONSOLE, sb::CONSOLE, Rights::WRITE, 0).is_ok()
+            && k::cap_mint(ENDPOINT, PROBE_FAULT, Rights::WRITE, fault).is_ok()
+            && k::thread_set_fault_ep(thread, PROBE_FAULT).is_ok();
+        let _ = k::cap_delete(PROBE_FAULT);
+        let mut argument = 0;
+        if probe.mode == mode::FUZZ {
+            // The fuzzer gets real capabilities so that its calls reach deep into
+            // the kernel: a private frame, its address space, a memory budget.
+            argument = k::random();
+            println!("  fuzzer seed: {argument:#x}");
+            ready &= k::retype(slot::UNTYPED, abi::obj::FRAME, FUZZ_FRAME).is_ok()
+                && k::thread_grant(thread, FUZZ_FRAME, sb::SHARED_FRAME, rwx, 0).is_ok()
+                && k::thread_grant(
+                    thread,
+                    slot::PROBE_VSPACE_FIRST + i,
+                    sb::VSPACE,
+                    Rights::WRITE,
+                    0,
+                )
+                .is_ok()
+                && k::thread_grant(thread, slot::UNTYPED, sb::FUZZ_UNTYPED, Rights::WRITE, 0)
+                    .is_ok();
+        }
+        ready &= k::thread_start(thread).is_ok();
+        let served = if ready {
+            serve(
+                client,
+                fault,
+                probe.mode,
+                argument,
+                probe.mode == mode::FUZZ,
+            )
+        } else {
+            None
+        };
+        let _ = k::cap_delete(FUZZ_FRAME);
+        // An address space lives as long as a capability refers to it: dropping
+        // ours lets the kernel reclaim the dead process's memory.
+        let _ = k::cap_delete(slot::PROBE_VSPACE_FIRST + i);
+        let _ = k::cap_delete(thread);
+        let Some(served) = served else {
+            s.check(probe.name, false, "could not run the probe");
+            continue;
+        };
+
+        let [vector, error, ..] = served.end;
+        let exited = |code: u64| vector == abi::EXIT_VECTOR && error == code;
+        let as_expected = match probe.expect {
+            Expect::Fault {
+                vector: v,
+                error_bits,
+            } => vector == v && error & error_bits == error_bits,
+            Expect::FaultEither(a, b) => vector == a || vector == b,
+            Expect::FaultOrNotApplicable(v) => vector == v || exited(selftest::EXIT_NOT_APPLICABLE),
+            Expect::Exit(code) => exited(code),
+        };
+        s.check(
+            probe.name,
+            as_expected && !served.wrong_badge,
+            Outcome(served.end),
+        );
+
+        // The dead process must have given everything back.
+        let after = k::kernel_stats(slot::CONSOLE).unwrap_or_default();
+        let freed = after.free_frames.saturating_sub(before.free_frames);
+        // (The fuzzer makes the kernel's tables grow to their working size, so its
+        // memory balance is not comparable.)
+        let fuzzer = probe.mode == mode::FUZZ;
+        if !fuzzer {
+            min_freed = min_freed.min(freed);
+            max_freed = max_freed.max(freed);
+        }
+        clean &= after.threads + 1 == before.threads
+            && after.capabilities + 2 == before.capabilities
+            && after.endpoints == before.endpoints
+            && after.frames == before.frames
+            && (fuzzer || after.heap_bytes < before.heap_bytes);
+    }
+    s.check(
+        "every terminated process returned all of its kernel objects",
+        clean,
+        "threads, capabilities, endpoints, frames, heap",
+    );
+    s.check(
+        "every terminated process returned its memory",
+        min_freed > 16 && max_freed - min_freed <= 8,
+        format_args!("{min_freed}..{max_freed} frames each"),
+    );
+    let end = k::kernel_stats(slot::CONSOLE).unwrap_or_default();
+    s.check(
+        "only the root task is left",
+        end.threads == 1 && end.endpoints == 1,
+        format_args!("{}", StatsLine(end)),
     );
 }
 
@@ -580,9 +922,12 @@ pub extern "C" fn _start() -> ! {
     capability_tests(&mut s);
     pointer_tests(&mut s);
     memory_tests(&mut s);
+    copy_tests(&mut s);
     quota_tests(&mut s);
+    leak_tests(&mut s);
     if setup_sandbox(&mut s) {
-        serve_sandbox(&mut s);
+        run_sandbox(&mut s);
+        run_probes(&mut s);
     }
     println!("==================================================================");
     if s.failed == 0 {

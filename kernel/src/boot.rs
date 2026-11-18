@@ -229,28 +229,65 @@ pub fn memory_map() -> MemoryMap {
     map
 }
 
-/// A boot module (user-space program image).
+/// The boot modules (user-space program images), recorded as *physical* ranges.
+///
+/// The bootloader hands out pointers into its own direct map, which the kernel
+/// replaces with a randomly placed one. Physical ranges stay valid across that
+/// switch; names are matched against the expected set while the bootloader's
+/// strings are still readable.
 #[derive(Clone, Copy, Debug)]
-pub struct Module {
-    pub path: &'static str,
-    pub data: &'static [u8],
+pub struct Modules {
+    /// `(index into the expected names, physical address, length)`.
+    known: [Option<(u64, usize)>; Self::MAX_KNOWN],
+    /// Number of modules the bootloader loaded, including unexpected ones.
+    pub total: usize,
 }
 
-/// Calls `f` for every boot module.
-pub fn for_each_module(mut f: impl FnMut(Module)) {
-    let Some(resp) = MODULES.response() else {
-        return;
-    };
-    for i in 0..resp.module_count as usize {
-        // SAFETY: `modules` is an array of `module_count` valid `File` pointers.
-        let file = unsafe { &**resp.modules.add(i) };
-        // SAFETY: each file's data is `size` bytes at `address` in the direct map, in
-        // memory the kernel never reclaims (EXECUTABLE_AND_MODULES).
-        let data = unsafe { core::slice::from_raw_parts(file.address, file.size as usize) };
-        f(Module {
-            path: cstr(file.path),
-            data,
-        });
+impl Modules {
+    const MAX_KNOWN: usize = 4;
+
+    /// Records every boot module. `expected` lists the module names the kernel
+    /// knows. Must be called while the bootloader's direct map is still active.
+    #[must_use]
+    pub fn capture(expected: &[&str]) -> Self {
+        let mut modules = Self {
+            known: [None; Self::MAX_KNOWN],
+            total: 0,
+        };
+        let Some(resp) = MODULES.response() else {
+            return modules;
+        };
+        let hhdm = crate::mm::hhdm();
+        for i in 0..resp.module_count as usize {
+            // SAFETY: `modules` is an array of `module_count` valid `File` pointers.
+            let file = unsafe { &**resp.modules.add(i) };
+            modules.total += 1;
+            let path = cstr(file.path);
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let index = expected
+                .iter()
+                .take(Self::MAX_KNOWN)
+                .position(|e| *e == name);
+            let phys = (file.address as u64).checked_sub(hhdm);
+            if let (Some(index), Some(phys)) = (index, phys)
+                && modules.known[index].is_none()
+            {
+                modules.known[index] = Some((phys, file.size as usize));
+            }
+        }
+        modules
+    }
+
+    /// The contents of the module with the given index in the expected names.
+    #[must_use]
+    pub fn data(&self, index: usize) -> Option<&'static [u8]> {
+        let (phys, len) = (*self.known.get(index)?)?;
+        // SAFETY: the module occupies `len` bytes at `phys` in memory of type
+        // EXECUTABLE_AND_MODULES, which the kernel never reclaims or writes to and
+        // which is covered by whichever direct map is currently active.
+        Some(unsafe {
+            core::slice::from_raw_parts(crate::mm::phys_to_virt(phys) as *const u8, len)
+        })
     }
 }
 

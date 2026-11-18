@@ -38,9 +38,9 @@
 | Authority can be withdrawn | Derivation tree, transitive revocation across CSpaces, revocation also removes frame mappings |
 | No confused-deputy via pointers | User memory is accessed only after a page-table walk of the *caller's* address space with user-permission checks; kernel addresses can never be named |
 | Memory isolation | Separate address spaces, supervisor-only kernel half, SMEP/SMAP, NX, W^X, zeroed frames |
-| Kernel integrity | Rust memory safety, `unsafe` confined and documented, W^X kernel image, write-protect (CR0.WP), guard pages, IST stacks, hardened heap, overflow checks, fail-closed panics |
+| Kernel integrity | Rust memory safety, `unsafe` confined and documented, W^X kernel image, write-protect (CR0.WP), guard pages, IST stacks (incl. `#DB`), hardened heap, overflow checks, fail-closed panics, a self-audit of the whole object graph |
 | Register / microarchitectural state | GPRs scrubbed on entry and restored only from saved user state; SIMD disabled; `lfence` after `swapgs`; IBPB on address-space switch; VERW on return; Spectre-v1 index clamping; `rdtsc` privileged |
-| Address secrecy | KASLR; randomised physmap, stack, heap and MMIO regions; user ASLR; UMIP |
+| Address secrecy | KASLR; the kernel relocates its direct map of physical memory to a random address; randomised stack, heap and MMIO regions; user ASLR; UMIP |
 | Availability | Kernel never blocks; every user-triggerable error returns an error code; untyped budgets (revocable together with everything built from them); per-address-space page-table quota with reclamation of empty tables; a kernel frame reserve that user activity can never consume; hard limits on all kernel tables; supervised threads report their exit to their supervisor |
 | Boot integrity | Pinned bootloader (tag, commit, digest); BLAKE2b-512 of kernel and modules checked by Limine; module digests compiled into the kernel and re-checked; tamper test in CI |
 | Supply chain | No third-party crates in the kernel; `cargo-deny`; CI actions pinned to commit SHAs; minimal workflow permissions |
@@ -77,4 +77,11 @@ vulnerabilities, but contributions are very welcome.
   attacker who can rewrite the boot partition can replace the kernel *and* its
   compiled-in digests. Enabling UEFI Secure Boot with a signed Limine and an
   enrolled config hash (`limine enroll-config`) closes this gap.
-* **Not formally verified.** The capability model is tested and fuzzed, not proven.
+* **Error codes check rights before type.** A capability of the wrong type that
+  also lacks the required right yields `EPERM`, not `ETYPE`. Both are refusals;
+  the caller learns nothing it cannot read with `cap_info` on its own slot.
+* **Tested on an emulated CPU.** The suite runs under QEMU's TCG. Mitigations for
+  hardware side channels (IBRS, STIBP, IBPB, VERW) are enabled when the CPU offers
+  them but their effect is not measured.
+* **Not formally verified.** The capability model is tested against a reference
+  model and fuzzed, not proven.

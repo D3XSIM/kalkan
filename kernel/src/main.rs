@@ -48,9 +48,13 @@ const BANNER: &str = r"
 /// The link-time base address of the kernel image (see `linker.ld`).
 const LINK_BASE: u64 = 0xffff_ffff_8000_0000;
 
+/// The boot modules the kernel expects — and the only ones it accepts.
+const MODULE_NAMES: [&str; 2] = ["init", "sandbox"];
+
 /// State carried from the bootloader stack to the kernel stack.
 struct BootState {
     map: MemoryMap,
+    modules: boot::Modules,
     layout: Layout,
     rng: ChaChaRng,
     features: Features,
@@ -76,12 +80,19 @@ pub(crate) extern "C" fn boot_main() -> ! {
     let hhdm = boot::hhdm_offset().expect("no HHDM response from the bootloader");
     mm::set_hhdm(hhdm);
     if let Some((phys, virt)) = boot::kernel_address() {
-        kprintln!("[boot] kernel image at {virt:#x} (physical {phys:#x}), direct map at {hhdm:#x}");
+        kprintln!("[boot] kernel image at {virt:#x} (physical {phys:#x})");
     }
+    // Boot modules are recorded as physical ranges: the bootloader's direct map
+    // (and every pointer into it) disappears when the kernel installs its own.
+    let modules = boot::Modules::capture(&MODULE_NAMES);
 
     arch::gdt::init();
     arch::idt::init();
 
+    assert!(
+        !arch::cpu::five_level_paging(),
+        "5-level paging is active; this kernel only supports 4-level paging"
+    );
     let features = arch::cpu::detect();
     let vendor = core::str::from_utf8(&features.vendor).unwrap_or("?");
     kprintln!("[cpu] vendor {vendor}");
@@ -109,6 +120,7 @@ pub(crate) extern "C" fn boot_main() -> ! {
 
     *BOOT.lock() = Some(BootState {
         map,
+        modules,
         layout,
         rng,
         features,
@@ -119,23 +131,16 @@ pub(crate) extern "C" fn boot_main() -> ! {
 }
 
 /// Verifies every boot module against the digest compiled into the kernel.
-fn verified_modules() -> Vec<(&'static str, &'static [u8])> {
-    let expected = [
-        ("init", option_env!("KALKAN_INIT_BLAKE2B")),
-        ("sandbox", option_env!("KALKAN_SANDBOX_BLAKE2B")),
+fn verified_modules(modules: &boot::Modules) -> Vec<(&'static str, &'static [u8])> {
+    let digests = [
+        option_env!("KALKAN_INIT_BLAKE2B"),
+        option_env!("KALKAN_SANDBOX_BLAKE2B"),
     ];
-    let mut found: Vec<(&'static str, &'static [u8])> = Vec::new();
-    boot::for_each_module(|m| {
-        let name = m.path.rsplit('/').next().unwrap_or(m.path);
-        found.push((name, m.data));
-    });
     kprintln!("Boot module integrity (BLAKE2b-512):");
     let mut verified = Vec::new();
-    for (name, digest) in expected {
-        let data = found
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, d)| *d)
+    for (index, (name, digest)) in MODULE_NAMES.into_iter().zip(digests).enumerate() {
+        let data = modules
+            .data(index)
             .unwrap_or_else(|| panic!("boot module '{name}' is missing"));
         let digest = digest.unwrap_or_else(|| {
             panic!("no reference digest for '{name}' compiled in (build with `cargo xtask`)")
@@ -157,7 +162,7 @@ fn verified_modules() -> Vec<(&'static str, &'static [u8])> {
         );
         verified.push((name, data));
     }
-    if found.len() != verified.len() {
+    if modules.total != verified.len() {
         panic!("unexpected extra boot modules: refusing to boot");
     }
     verified
@@ -167,6 +172,7 @@ fn verified_modules() -> Vec<(&'static str, &'static [u8])> {
 extern "C" fn stage2() -> ! {
     let BootState {
         map,
+        modules,
         layout,
         mut rng,
         features,
@@ -178,7 +184,8 @@ extern "C" fn stage2() -> ! {
     arch::syscall::init(layout.stack_top);
     arch::apic::init(layout.lapic_virt);
     kprintln!(
-        "[mm] kernel page tables active; local APIC in {} mode",
+        "[mm] kernel page tables active; direct map at {:#x}; local APIC in {} mode",
+        layout.direct_map,
         if arch::apic::is_x2apic() {
             "x2APIC"
         } else {
@@ -189,7 +196,7 @@ extern "C" fn stage2() -> ! {
     let slide = layout.kernel_virt.wrapping_sub(LINK_BASE);
     posture::verify(&features, &posture, &layout, &seed, slide);
 
-    let modules = verified_modules();
+    let modules = verified_modules(&modules);
     rng.reseed(&arch::rdtsc().to_le_bytes());
     kernel::init(rng, &modules);
 

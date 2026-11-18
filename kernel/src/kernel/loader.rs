@@ -37,6 +37,11 @@ pub enum LoadError {
 pub struct Spawned {
     pub thread: ThreadId,
     pub vspace: VSpaceId,
+    pub base: u64,
+    pub entry: u64,
+    pub stack_top: u64,
+    pub segments: usize,
+    pub relocations: usize,
 }
 
 /// A random page-aligned address `a` with `[a, a + span)` inside `[lo, hi)`.
@@ -158,14 +163,13 @@ pub fn spawn(k: &mut Kernel, name: &str, file: &[u8]) -> Result<Spawned, LoadErr
             return Err(LoadError::Limit);
         }
     };
-    crate::kprintln!(
-        "[loader] '{}': {} segments, {} relocations, base {:#x}, entry {:#x}, stack top {:#x}",
-        name,
-        image.segments.len(),
-        image.relocations.len(),
+    Ok(Spawned {
+        thread,
+        vspace,
         base,
         entry,
-        stack_top
-    );
-    Ok(Spawned { thread, vspace })
+        stack_top,
+        segments: image.segments.len(),
+        relocations: image.relocations.len(),
+    })
 }

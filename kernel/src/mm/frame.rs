@@ -10,6 +10,8 @@ use super::{MemoryMap, PAGE_SIZE, RegionKind, phys_to_virt};
 use crate::sync::SpinLock;
 
 static ALLOCATOR: SpinLock<Option<FrameBitmap<'static>>> = SpinLock::new(None);
+/// Physical address and length (in words) of the bitmap's storage.
+static STORAGE: SpinLock<(u64, usize)> = SpinLock::new((0, 0));
 
 fn zero(phys: u64) {
     // SAFETY: `phys` is a frame owned by the caller and covered by the direct map.
@@ -54,6 +56,20 @@ pub fn init(map: &MemoryMap) {
     bitmap.reserve_range(0, 1);
     bitmap.reserve_range((storage_base / PAGE_SIZE) as usize, pages as usize);
     *ALLOCATOR.lock() = Some(bitmap);
+    *STORAGE.lock() = (storage_base, words);
+}
+
+/// Re-attaches the allocator to its bitmap after the direct map of physical
+/// memory has moved to a new virtual address (see `kspace::enter`).
+pub fn rebase() {
+    let (storage_base, words) = *STORAGE.lock();
+    let mut guard = ALLOCATOR.lock();
+    let bitmap = guard.take().expect("frame allocator not initialised");
+    // SAFETY: the same storage pages as in `init`, now reachable through the new
+    // direct map. The old slice inside `bitmap` is dropped without being used.
+    let words_slice =
+        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(storage_base) as *mut u64, words) };
+    *guard = Some(bitmap.with_storage(words_slice).expect("bitmap storage"));
 }
 
 /// Releases bootloader-reclaimable memory once nothing references it any more.

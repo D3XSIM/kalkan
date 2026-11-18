@@ -253,12 +253,28 @@ extern "C" fn kalkan_trap_entry(frame: *mut TrapFrame) {
 /// A trap taken while executing kernel code.
 ///
 /// The kernel runs with interrupts disabled, so the only possible causes are CPU
-/// exceptions — i.e. kernel bugs — or NMI / machine check. All of them are fatal:
-/// the kernel stops instead of continuing in a possibly corrupted state.
-fn kernel_trap(frame: &TrapFrame) {
+/// exceptions — i.e. kernel bugs — or NMI / machine check / debug traps. Bugs are
+/// fatal: the kernel stops instead of continuing in a possibly corrupted state.
+fn kernel_trap(frame: &mut TrapFrame) {
     match frame.vector {
         SPURIOUS_VECTOR => {}
-        8 => panic!("double fault (kernel stack overflow into a guard page?)\n{frame:#x?}"),
+        // A debug trap in kernel mode can only be a single-step or breakpoint that
+        // leaked in from user space. It runs on its own IST stack, so it is
+        // harmless: disarm it and continue.
+        1 => {
+            frame.rflags &= !(1 << 8); // TF
+            super::cpu::reset_debug_registers();
+        }
+        // Not caused by the interrupted code; it uses the log without taking the
+        // lock because the interrupted code may hold it.
+        2 => crate::log::print_force(format_args!(
+            "[kernel] NMI in kernel mode; ignored
+"
+        )),
+        8 => panic!(
+            "double fault (kernel stack overflow into a guard page?)
+{frame:#x?}"
+        ),
         14 => panic!(
             "kernel page fault at {:#x} (error {:#x}, rip {:#x})",
             super::read_cr2(),

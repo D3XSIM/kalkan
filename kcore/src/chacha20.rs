@@ -193,4 +193,87 @@ mod tests {
             }
         }
     }
+
+    /// Keystream blocks computed with an independent implementation (OpenSSL's
+    /// `enc -chacha20`) for several keys, nonces and counters, including a
+    /// counter close to its maximum.
+    #[test]
+    fn cross_checked_against_openssl() {
+        let cases: [(&str, u32, &str, &str, &str); 4] = [
+            (
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                0,
+                "000000000000000000000000",
+                "39fd2b7dd9c5196a8dbd0377b8dc4a498a35d86fbcde6accb2cc7d4cd8ea24922b23cce7a26023ab3f0eef693ac87f64258235eab1f7a32dc22762a0485b410c",
+                "18b84231ade6a6d113615c61af434e27f8b1f3f5e1ad5b5cecf8fc122a35755c7208086dd1ee3c5d9d815824640e003c9ba0f65ede5d59ce0d2a4a7f31955acd",
+            ),
+            (
+                "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc",
+                1,
+                "05101b26313c47525d68737e",
+                "36a385055b4489e19deb47976012acb05a9f0d547690bcd065a4bc7434f355d72a957074d4b61f83880d04233d1a2dec232fe55beeb517640a4539ec0af5fa97",
+                "a01bf0e5177f03affdd3a092f0b6d516256e5daaf2e87b6082e465f84ee0ab59a125d42b1aaf1e594ad3130948ac4c565db40dd59126eb98d2e92a7ec773b7d9",
+            ),
+            (
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                0xffff_fffe,
+                "ffffffffffffffffffffffff",
+                "7e5709961e09fccd84e36881e70abfd09e4f8c9cc9644c73dd5715cebf3c25e04925ea9f3eadd4532017b67842867d0824996dec95d758c2b2645013e23e8fca",
+                "d72b21cfa4b6b0c41d61f62b8a11159c6a4f63bc56c2035796c7ad37811121bbec56d54a530f3a933dd28a50feb23bfaf64f405be985f3718bdf4683e96be749",
+            ),
+            (
+                "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+                0x0102_0304,
+                "6465666768696a6b6c6d6e6f",
+                "e661ea0f813839762a6339c173fd6fac3066b5911be763dddbabe0416f26319bb6a63c4921ca84a35fbd3c11144c35059ba5ba6fafde91a74ad16270db2b1c1b",
+                "bfa5892eace3734f20cac112aa41ad52c59ba7f94f30527130b8332da3858d742fe59090e46409fc5d977b6fa1448486b3563360d3133ddec48ecb3d9c76e77f",
+            ),
+        ];
+        for (key, counter, nonce, first, second) in cases {
+            let key = hex::decode::<32>(key).unwrap();
+            let nonce = hex::decode::<12>(nonce).unwrap();
+            assert_eq!(
+                block(&key, counter, &nonce),
+                hex::decode::<64>(first).unwrap()
+            );
+            assert_eq!(
+                block(&key, counter + 1, &nonce),
+                hex::decode::<64>(second).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rng_output_never_contains_its_key() {
+        // The key in effect after a request must not be derivable from the output
+        // by simply reading it: the first 32 keystream bytes (the new key) are
+        // never handed out.
+        let mut rng = ChaChaRng::from_seed([9; 32]);
+        for len in [1usize, 31, 32, 33, 64, 96, 97, 500] {
+            let mut out = std::vec![0u8; len];
+            rng.fill_bytes(&mut out);
+            assert!(
+                !out.windows(32).any(|w| w == rng.key),
+                "output of length {len} leaks the next key"
+            );
+        }
+    }
+
+    #[test]
+    fn rng_bytes_look_uniform() {
+        let mut rng = ChaChaRng::from_seed([3; 32]);
+        let mut counts = [0u32; 256];
+        let mut buf = [0u8; 4096];
+        for _ in 0..64 {
+            rng.fill_bytes(&mut buf);
+            for b in buf {
+                counts[usize::from(b)] += 1;
+            }
+        }
+        // 262144 samples, 1024 expected per value; a generous +-25% band.
+        assert!(
+            counts.iter().all(|&c| (768..=1280).contains(&c)),
+            "{counts:?}"
+        );
+    }
 }

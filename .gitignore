@@ -4,3 +4,4 @@
 /fuzz/artifacts
 *.swp
 .DS_Store
+/.claude/

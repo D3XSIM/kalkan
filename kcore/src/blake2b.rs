@@ -197,4 +197,95 @@ mod tests {
         }
         assert_eq!(h.finalize(), hash(&block));
     }
+
+    /// Deterministic test data (the Python script that produced the reference
+    /// digests uses the same formula).
+    fn pattern(n: usize) -> std::vec::Vec<u8> {
+        (0..n)
+            .map(|i| (((i * 167 + 13) ^ (i >> 8)) & 0xff) as u8)
+            .collect()
+    }
+
+    /// Digests computed with an independent implementation (Python's `hashlib`,
+    /// i.e. OpenSSL/libb2) for inputs around every block boundary.
+    #[test]
+    fn cross_checked_against_hashlib() {
+        let vectors: [(usize, &str); 12] = [
+            (
+                1,
+                "f5e25392a404fdde29fff6087777f9087d7c216ad4213030b011c1aabc9c7592ef7b3b8ff318c272a31fe7a827400db89e4932c3cf0808d0cb9388b560336cfe",
+            ),
+            (
+                63,
+                "fb43ee818e1e43bec5764a788a1e0213f2953e6c40bb2eb20cb50ae717d7b83e15f720558c96296678f64f0de2cdf3d28b26f583e7f7c743cd09d07624b8ece5",
+            ),
+            (
+                64,
+                "6e385958481a300261de8fbfe92432278220fd9ed8ed2142b7a86387d3360adba2ef933657a52670bc8e2947d048644db0e18ad1c4a8546fcdceefb2295e1432",
+            ),
+            (
+                127,
+                "2a2bf0c7eb6c5f7bbb923a1236894af3bb435ffe0d43d14e310055ef0c3848ba4ef64e625c08d6e84dcee4ee1b89a73d306c23e809abc76d075956f325b5519d",
+            ),
+            (
+                128,
+                "cfd60fd01809f22c0c1ae01f4f73227373273470eba2bd875e66c9127ade1c2f91aa3164aa5a0fd492bb7813e1a8c705ab3b5bf6a317ce7ce4d4308f693753b2",
+            ),
+            (
+                129,
+                "05a880ec1f4512c1136fe0cda87c6e2c2af4958b28979c932a3596190f4cb1a12be2c11f5d1d8f17e69c702e22fb7fb2dbeb071060c9566108809152ea14b5c3",
+            ),
+            (
+                255,
+                "15ed289a32e07e43cf74a221cd1170309e8c08de518877675a67d7dd0e0adbecc1e0bfd6ca45fe311d9c8ed1f6b72d8bd2ee258a64dfa73aaa11bcd12c666eab",
+            ),
+            (
+                256,
+                "f552db3d0ed73999d4b8e70dd3e210fd39843889e9d961902b39965aa6da84443c421ee0ed9c996262eeefcd588f5f7981648eca9ac61617d11a80c6b73ebfef",
+            ),
+            (
+                257,
+                "ea036ecee40e61bf2365fc2cfa92cb9db53eb4c004cd69bd74279e5ce66840e858c56d9a9e164a387e14582cb7baecd23043bc184750ccbc880d32d860666f5a",
+            ),
+            (
+                1000,
+                "a20557f0857acb32f39b1ebf0f37a8446523790a6f2a324aefebcadd5a04773c38b97e458148a8efed912b868b57b6471c3feef1cdd694462ec3e3e1d084480d",
+            ),
+            (
+                4096,
+                "87896c9d8c1878f1a4e9cfe8c3d5089edf4357240f806f7b2f2364b6130fac4d7a7c9378cca4a36ba7b848d17b2af84595d21ecf4f7c5b4c4b8a102ca7bee5cf",
+            ),
+            (
+                65537,
+                "930164f703a81371af104d9744b843d5a42749c8aeee0c0569431f5677b9ac14bba8819cf4fac4b1fdbffd8f2a1596e75c3227ea9719897dc0e94d2f16c35582",
+            ),
+        ];
+        for (len, expected) in vectors {
+            let data = pattern(len);
+            assert_eq!(hash(&data), hex64(expected), "one-shot, {len} bytes");
+            // The same input fed in uneven pieces must give the same digest.
+            for chunk in [1usize, 7, 127, 128, 129, 1000] {
+                let mut h = Blake2b::new();
+                for piece in data.chunks(chunk) {
+                    h.update(piece);
+                }
+                assert_eq!(
+                    h.finalize(),
+                    hex64(expected),
+                    "{len} bytes in chunks of {chunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_bit_changes_the_digest() {
+        let base = pattern(300);
+        let reference = hash(&base);
+        for bit in 0..300 * 8 {
+            let mut data = base.clone();
+            data[bit / 8] ^= 1 << (bit % 8);
+            assert_ne!(hash(&data), reference, "bit {bit}");
+        }
+    }
 }

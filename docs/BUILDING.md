@@ -41,13 +41,16 @@ brew install qemu git
 |---|---|
 | `cargo xtask build` | Builds user programs, validates them, builds the kernel with their digests, fetches and verifies Limine, assembles `target/esp/` |
 | `cargo xtask run` | `build` + boots in QEMU with the serial console on your terminal |
-| `cargo xtask test` | Release build with the `qemu-exit` feature, runs the security suite headless, then the tamper test |
+| `cargo xtask check` | Static checks: no third-party packages, `unsafe` confinement, forbidden instructions, CI pinning, docs vs ABI |
+| `cargo xtask test` | Static checks, then a release build with the `qemu-exit` and `audit` features and every QEMU scenario: the suite on three machine sizes, randomisation, fail-closed CPUs, boot tampering (~2.5 min) |
+| `cargo xtask test --quick` | The suite on the default machine and one tamper test (~20 s) |
 | `cargo xtask build --debug` / `run --debug` | Same with a debug kernel |
-| `cargo test -p kalkan-core` | Host tests of the policy core |
+| `cargo test -p kalkan-core -p xtask` | Host tests of the policy core and the build tool |
+| `cargo test -p kalkan-core --release -- --ignored` | Stress tests (millions of model steps and mutations) |
 | `cargo +nightly fuzz run elf` (in `fuzz/`) | Fuzz the ELF validator (needs `cargo install cargo-fuzz`) |
 
-Logs of test runs are written to `target/kalkan-test.log` and
-`target/kalkan-tamper.log`.
+Serial logs of every boot are written to `target/kalkan-*.log`. How the tests
+work is described in [TESTING.md](TESTING.md).
 
 ## Environment variables
 
@@ -77,6 +80,9 @@ SMAP.
 
 * **`linker 'x86_64-w64-mingw32-gcc' not found` / `link.exe not found`** — set the
   default host as described above, or install Visual Studio Build Tools.
+* **`PANIC: High memory allocator: Out of memory`** — printed by the bootloader, not
+  the kernel: the virtual machine needs at least 128 MiB of RAM for the firmware
+  and Limine.
 * **`UEFI firmware (OVMF) not found`** — install `ovmf`, or set `KALKAN_OVMF`.
 * **`no reference digest ... compiled in`** — the kernel was built without
   `cargo xtask`; it refuses to run unverified modules by design.

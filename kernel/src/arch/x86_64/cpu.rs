@@ -200,6 +200,8 @@ pub fn harden(f: &Features) -> Result<Posture, Unsupported> {
     // can stay enabled at all times.
     unsafe { asm!("mov cr4, {}", in(reg) c4, options(nostack, preserves_flags)) };
 
+    reset_debug_registers();
+
     // Read everything back: report what is *actually* in effect.
     let c0 = read_cr0();
     let c4 = read_cr4();
@@ -215,6 +217,27 @@ pub fn harden(f: &Features) -> Result<Posture, Unsupported> {
         simd_disabled: c0 & cr0::EM != 0 && c4 & (cr4::OSFXSR | cr4::OSXSAVE) == 0,
         fsgsbase_disabled: c4 & cr4::FSGSBASE == 0,
     })
+}
+
+/// Disarms every hardware breakpoint (DR7) and clears the debug status (DR6).
+/// User code cannot access debug registers, so after this no breakpoint exists.
+pub fn reset_debug_registers() {
+    // SAFETY: writing the reset values to DR7/DR6 only disables breakpoints.
+    unsafe {
+        asm!(
+            "mov dr7, {dr7}",
+            "mov dr6, {dr6}",
+            dr7 = in(reg) 0x400u64,
+            dr6 = in(reg) 0xffff_0ff0u64,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// `true` if 5-level paging is active (the kernel only implements 4 levels).
+#[must_use]
+pub fn five_level_paging() -> bool {
+    read_cr4() & (1 << 12) != 0
 }
 
 static HAS_IBPB: AtomicBool = AtomicBool::new(false);

@@ -121,6 +121,7 @@ impl Kernel {
                 }
                 Ok(())
             }
+            sys::KERNEL_STATS => self.sys_kernel_stats(t, cspace, a[0]),
             _ => Err(Error::NoSys),
         };
         self.finish_syscall(t, result);
@@ -201,6 +202,27 @@ impl Kernel {
             .copy_from_user(ptr, buf)
             .map_err(|_| Error::BadAddress)?;
         log::write_untrusted(&prefix(&th.name), buf);
+        Ok(())
+    }
+
+    fn sys_kernel_stats(&mut self, t: ThreadId, cs: CSpaceId, slot: u64) -> SysResult {
+        let cap = self.caps.lookup(cs, slot, Rights::READ)?;
+        if cap.object != Object::Console {
+            return Err(Error::WrongType);
+        }
+        let (free, _) = mm::frame::stats();
+        let values = [
+            free as u64,
+            mm::heap::allocated() as u64,
+            self.caps.len() as u64,
+            self.threads.len() as u64,
+            self.frames.len() as u64,
+            self.endpoints.len() as u64,
+        ];
+        let th = self.threads.get_mut(t).ok_or(Error::Dead)?;
+        [
+            th.ctx.rdi, th.ctx.rsi, th.ctx.rdx, th.ctx.r10, th.ctx.r8, th.ctx.r9,
+        ] = values;
         Ok(())
     }
 
