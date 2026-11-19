@@ -42,3 +42,13 @@ mitigate them.
 ## Supported versions
 
 Only the latest commit on the default branch is supported.
+
+## Hall of fame
+
+Everyone who reports a confirmed vulnerability is credited here, with a link to
+the fix and the regression test it added (unless you prefer to stay anonymous).
+Kalkan is a research project, so there is no money involved — only the credit,
+and a kernel that is better for it.
+
+*No findings yet. Be the first:* start from `user/sandbox`, which already tries
+over 120 ways out, and see the scope above.

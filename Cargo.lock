@@ -4,39 +4,39 @@ version = 4
 
 [[package]]
 name = "kalkan-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "kalkan-init"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libkalkan",
 ]
 
 [[package]]
 name = "kalkan-kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kalkan-core",
 ]
 
 [[package]]
 name = "kalkan-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libkalkan",
 ]
 
 [[package]]
 name = "libkalkan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kalkan-core",
 ]
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kalkan-core",
 ]

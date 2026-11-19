@@ -18,6 +18,56 @@ authority) yoktur; her çekirdek nesnesine yalnızca sahte üretilemeyen bir
 her programı doğrular ve her CI çalıştırmasında güvenilmeyen bir sürecin
 sandbox'tan kaçmaya çalıştığı saldırgan bir test paketiyle gelir.
 
+<p align="center">
+  <img src="docs/assets/demo.svg" width="100%" alt="Kalkan QEMU'da açılıyor: çekirdek donanım korumalarını ve açılış modüllerini doğruluyor, ardından güvenilmeyen süreçler saldırıyor; her saldırı engelleniyor ve 143 güvenlik testinin hepsi geçiyor">
+</p>
+
+## Bir dakikada dene
+
+Rust kurmana gerek yok. [Son sürüm sayfasından](https://github.com/D3XSIM/kalkan/releases/latest)
+**`kalkan-demo-v0.2.0.zip`** dosyasını indir, zip'ten çıkar ve QEMU ile çalıştır:
+
+| Sistem | QEMU kurulumu | Çalıştırma |
+|---|---|---|
+| Windows | `winget install SoftwareFreedomConservancy.QEMU` | `run.cmd` dosyasına çift tıkla |
+| Debian / Ubuntu | `sudo apt install qemu-system-x86 ovmf` | `./run.sh` |
+| Fedora | `sudo dnf install qemu-system-x86 edk2-ovmf` | `./run.sh` |
+| macOS | `brew install qemu` | `./run.sh` |
+
+Yaklaşık yarım dakikada çekirdeğin kendi donanım korumalarını ve açılış
+modüllerini doğrulamasını, ardından her yönden saldıran güvenilmeyen süreçlere
+karşı koymasını izlersin: toplam 143 güvenlik testi. Paketteki çekirdek bir [test çekirdeğidir](docs/ARCHITECTURE.md#test-kernels)
+(CI'ın denetlediği yapılandırmanın aynısı); önyükleyici içindeki her dosyayı
+çalıştırmadan önce BLAKE2b-512 özetiyle doğrular. Aynı paketi kendin üretmek için:
+`cargo xtask dist`.
+
+## Kır beni 🎯
+
+Kalkan'ın iddiaları ancak onu kırmaya çalışanlara dayanırsa bir değer taşır.
+Güvenilmeyen bir süreç çekirdek belleğini okuyabiliyor ya da yazabiliyor, bir
+yetkiyi taklit edebiliyor ya da geri alındıktan sonra tutabiliyor, başka bir
+süreç kılığına girebiliyor, çekirdeği çökertebiliyor ya da kilitleyebiliyor,
+veya bir çekirdek adresini öğrenebiliyor mu? Zaten 120'den fazla yolu deneyen
+[`user/sandbox`](user/sandbox/src) ile başla ve bulduğunu
+[gizlice bildir](https://github.com/D3XSIM/kalkan/security/advisories/new).
+Doğrulanan her bulgu açıkça düzeltilir, test paketine bir regresyon testi olarak
+eklenir ve bulan kişi [onur listesine](SECURITY.md#hall-of-fame) yazılır.
+
+## Kalkan nasıl yapıldı
+
+Kalkan, sahibinin yönlendirmesiyle yapay zekâ kodlama ajanları (Anthropic'in
+Claude modeli, Claude Code aracılığıyla) tarafından yazıldı. Bu, **daha fazla**
+inceleme için bir sebep; bu yüzden burada hiçbir şey yazarının sözüne güvenilerek
+kabul edilmiyor:
+
+* README'deki her güvenlik iddiası, her commit'te çalışan bir testle desteklenir;
+* sınırlamalar [tehdit modelinde](docs/THREAT_MODEL.md#known-limitations) açıkça
+  listelenir;
+* geçmiş açıktır: incelemelerde bulunan hatalar ve artık onlara karşı koruyan
+  testler [CHANGELOG](CHANGELOG.md) içinde görülebilir.
+
+Yapabileceğin en değerli katkı, bağımsız bir insan incelemesidir.
+
 ## Öne çıkanlar
 
 - 🔑 **Capability modeli, varsayılan yetki yok** — seL4 tarzı yetki alanları
@@ -70,9 +120,11 @@ rustup set default-host x86_64-pc-windows-gnu   # Visual Studio yoksa
 ```
 
 ```sh
-cargo xtask run             # her şeyi derle ve Kalkan'ı QEMU'da aç
+cargo xtask run             # bir test çekirdeği derle ve QEMU'da aç
 cargo xtask test            # tüm güvenlik senaryoları (CI'ın çalıştırdığı, ~2,5 dk)
-cargo xtask test --quick    # paket + bir kurcalama testi (~20 sn)
+cargo xtask test --quick    # paket + bir kurcalama testi (~1 dk)
+cargo xtask build           # normal çekirdek (test olanakları olmadan)
+cargo xtask dist            # sürüm sayfasındaki demo paketi
 cargo test -p kalkan-core   # politika çekirdeğinin birim/özellik testleri
 ```
 

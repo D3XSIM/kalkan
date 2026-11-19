@@ -24,40 +24,77 @@ The kernel verifies its own hardware protections at boot, verifies every program
 loads, audits its own data structures, and ships with an adversarial test suite in
 which untrusted processes attack it from every angle on every CI run.
 
+<p align="center">
+  <img src="docs/assets/demo.svg" width="100%" alt="Kalkan booting in QEMU: the kernel checks its hardware protections and boot modules, then untrusted processes attack it; every attack is blocked and all 143 security tests pass">
+</p>
+
+<details>
+<summary>The same run as text</summary>
+
 ```text
+Kalkan v0.2.0 booting
+[boot] bootloader: Limine 11.2.1
 Security posture:
   [PASS] NX (no-execute pages)                  EFER.NXE
   [PASS] SMEP (no kernel exec of user pages)    CR4.SMEP
   [PASS] SMAP (no kernel access to user pages)  CR4.SMAP, never lifted
   [PASS] UMIP (hide descriptor tables)          CR4.UMIP
   [PASS] W^X kernel image                       .text R-X, .rodata R--, .data RW-
-  [PASS] Kernel image alias in direct map       read-only, NX
-  [PASS] Kernel stack guard pages               unmapped page below and above
-  [PASS] KASLR (kernel image)                   slide 0x4be4e000
-  [PASS] Randomised stack/heap/MMIO placement   PML4 slots [472, 403, 366]
+  [PASS] KASLR (kernel image)                   slide 0x52cf2000
 Boot module integrity (BLAKE2b-512):
-  [PASS] init      202032 bytes  87172c1940a21687...
-  [PASS] sandbox   222992 bytes  d933d13af9732011...
-...
-[sandbox]   [BLOCKED] add GRANT to its console capability (EPERM)
+  [PASS] init      257672 bytes  2c1ba5134cd341d0...
+  [PASS] sandbox   226736 bytes  21060fc06f774ce7...
+[mm] kernel page tables active; direct map at 0xffffd1bec0000000; local APIC in x2APIC mode
+[kernel] root task 'init' ready with 127 initial capabilities; 'sandbox' and 60 probe processes created (inactive); test kernel
 [sandbox]   [BLOCKED] forge a different badge (identity spoofing) (EINVAL)
 [sandbox]   [BLOCKED] smuggle a capability over IPC (its console capability)
-[sandbox]   [BLOCKED] exhaust kernel memory by map/unmap cycling (page tables reclaimed)
-[sandbox]   [INFO] terminal escape injection attempt follows: ?[2J?[31mFAKE KERNEL LOG?[0m
-[init]   [PASS] sandbox escape attempts all refused (62 checks passed, 0 failed)
-[init] --- fault containment: one process per attack
-[init]   [PASS] write to kernel memory (killed: page fault at 0xffffffff80000000, error 0x6)
-[init]   [PASS] overflow its stack into the guard page (killed: page fault at 0x7c8f9a541c78, error 0x6)
+[sandbox]   [BLOCKED] kill the root task without a thread capability (EEMPTY)
+[init]   [PASS] sandbox escape attempts all refused (67 checks passed, 0 failed)
+[init]   [PASS] read kernel code (killed: page fault at 0xffffffffd2cf2000, error 0x5)
+[init]   [PASS] overwrite the kernel stack (killed: page fault at 0xfffffbae2e610ff8, error 0x7)
+[init]   [PASS] read the kernel through the direct map of physical memory (killed: page fault at 0xffffd1becbfc2000, error 0x5)
 [init]   [PASS] redirect the system call entry (wrmsr LSTAR) (killed: general protection fault)
-[init]   [PASS] fake a timer interrupt (int 32) (killed: general protection fault)
 [init]   [PASS] iretq into ring 0 (killed: general protection fault)
-[init]   [PASS] system calls with a hostile stack pointer and flags (exited with 0x600d)
-[probe46]   fuzzer: 24000 system calls, 2114 succeeded, errors by code [3520, 321, 4763, ...]
-[init]   [PASS] every terminated process returned all of its kernel objects
-[init] KALKAN-TEST: PASS - all 120 security tests passed
-[kernel] audit: object graph consistent (9 capabilities, 1 threads, ...); 44619 audits passed
+[probe53]   fuzzer: 24000 system calls, 1305 succeeded, errors by code [3491, 306, 4949, 8929, 10, 1488, 0, 194, 1512, 733, 0, 0, 55]
+[init]   [PASS] a server that dies holding a call releases its caller (the call returned EDEAD)
+[init]   [PASS] kill a process blocked in IPC (removed from the endpoint queue, everything reclaimed)
+[init] KALKAN-TEST: PASS - all 143 security tests passed
+[kernel] audit: object graph consistent (10 capabilities, 1 threads, 1 endpoints, 2 frames, 2 mappings, 9 page tables, 1 address spaces); 44890 audits passed, 702 with a full page-table walk
 [kernel] system shut down cleanly
 ```
+
+</details>
+
+## Try it in one minute
+
+No Rust toolchain needed. Download **`kalkan-demo-v0.2.0.zip`** from the
+[latest release](https://github.com/D3XSIM/kalkan/releases/latest), unzip it and
+run it in QEMU:
+
+| System | Install QEMU | Run |
+|---|---|---|
+| Windows | `winget install SoftwareFreedomConservancy.QEMU` | double-click `run.cmd` |
+| Debian / Ubuntu | `sudo apt install qemu-system-x86 ovmf` | `./run.sh` |
+| Fedora | `sudo dnf install qemu-system-x86 edk2-ovmf` | `./run.sh` |
+| macOS | `brew install qemu` | `./run.sh` |
+
+In about half a minute you watch the kernel verify its own hardware protections
+and boot modules, then hold out against untrusted processes that attack it from
+every angle: 143 security tests in all. The package
+holds a [test kernel](docs/ARCHITECTURE.md#test-kernels) — the exact configuration
+CI checks — and the bootloader verifies every file in it against a BLAKE2b-512
+digest before running it. To build the same package yourself: `cargo xtask dist`.
+
+## Break it 🎯
+
+Kalkan's claims are only worth something if they survive people trying to break
+them. Can an untrusted process read or write kernel memory, forge a capability
+or keep one after revocation, impersonate another process, crash or hang the
+kernel, or learn a kernel address? Start from
+[`user/sandbox`](user/sandbox/src), which already tries over 120 ways,
+and please [report what you find privately](https://github.com/D3XSIM/kalkan/security/advisories/new).
+Every confirmed finding is fixed in the open, gets a regression test in the suite,
+and earns a place in the [hall of fame](SECURITY.md#hall-of-fame).
 
 ## Highlights
 
@@ -163,9 +200,11 @@ toolchain from `rust-toolchain.toml` is installed automatically.
 # Ubuntu/Debian:        sudo apt install qemu-system-x86 ovmf
 # macOS:                brew install qemu
 
-cargo xtask run      # build everything and boot Kalkan in QEMU
+cargo xtask run      # build a test kernel and boot it in QEMU
 cargo xtask test     # every security scenario (what CI runs, ~2.5 min)
-cargo xtask test --quick   # suite + one tamper test (~20 s)
+cargo xtask test --quick   # suite + one tamper test (~1 min)
+cargo xtask build    # a normal kernel (no test facilities)
+cargo xtask dist     # the demo package from the release page
 cargo test -p kalkan-core   # host unit/property tests of the policy core
 ```
 
@@ -208,6 +247,20 @@ docs/             architecture, threat model, system calls, testing, building
 | Code quality | `rustfmt`, Clippy with `-D warnings`, `undocumented_unsafe_blocks = deny` | CI |
 
 Details: [docs/TESTING.md](docs/TESTING.md).
+
+## How Kalkan was built
+
+Kalkan was written by AI coding agents (Anthropic's Claude, working through Claude
+Code) at the direction of its maintainer. That is a reason for **more** scrutiny,
+not less, so nothing here asks to be trusted on its author's word:
+
+* every security claim in this README is backed by a test that runs on every commit;
+* the limitations are listed openly in the [threat model](docs/THREAT_MODEL.md#known-limitations);
+* the history shows the work in the open, including the bugs that reviews found
+  and the tests that now guard against them ([CHANGELOG](CHANGELOG.md)).
+
+Independent human review is the most valuable contribution you can make — see
+[Break it](#break-it-) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
 

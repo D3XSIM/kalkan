@@ -1,0 +1,45 @@
+name: Real hardware report
+description: You booted Kalkan on a physical machine — tell us what happened, good or bad.
+labels: [hardware report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kalkan has only been tested under QEMU so far, so every report from real hardware is valuable — including "it did not boot".
+        Kalkan prints to the first serial port (COM1, 115200 baud); without one you will not see output yet.
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: Vendor and model, or mainboard.
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: Intel Core i5-8250U / AMD Ryzen 5 3600 / ...
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - All security tests passed
+        - Booted, but some tests failed
+        - Refused to boot (fail-closed message)
+        - Crashed or hung
+        - No output at all
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Serial log
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.2.0

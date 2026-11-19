@@ -1149,8 +1149,12 @@ fn lifecycle_tests(s: &mut Suite) {
         "a server that dies holding a call releases its caller",
         exited_ok(served.as_ref()) && call == Some(Err(Error::Dead)),
         format_args!(
-            "the call returned {:?}",
-            call.map(|r| r.map_err(Error::name))
+            "the call returned {}",
+            match call {
+                Some(Err(e)) => e.name(),
+                Some(Ok(())) => "success",
+                None => "nothing",
+            }
         ),
     );
 

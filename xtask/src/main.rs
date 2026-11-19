@@ -6,6 +6,8 @@
 //!                               console on stdout)
 //! cargo xtask check             static checks of the project's security claims
 //! cargo xtask test  [--quick]   static checks + every QEMU scenario (what CI runs)
+//! cargo xtask dist              a demo package that runs without Rust (test kernel
+//!                               plus run scripts), in target/dist/
 //! ```
 //!
 //! `build` produces a normal kernel. `run` and `test` build a *test kernel*
@@ -24,6 +26,7 @@
 //!    BLAKE2b-512 digest.
 
 mod checks;
+mod dist;
 mod qemu;
 mod scenarios;
 
@@ -65,8 +68,11 @@ fn main() -> ExitCode {
             let esp = build(true, "qemu-exit,audit,selftest", "esp")?;
             scenarios::run(&esp, production.as_deref(), quick)
         }),
+        Some("dist") => build(true, "qemu-exit,audit,selftest", "esp-demo")
+            .and_then(|esp| dist::package(&esp))
+            .map(|_| ()),
         _ => {
-            eprintln!("usage: cargo xtask <build|run|check|test> [--debug] [--quick]");
+            eprintln!("usage: cargo xtask <build|run|check|test|dist> [--debug] [--quick]");
             return ExitCode::from(2);
         }
     };

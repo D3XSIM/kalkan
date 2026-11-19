@@ -39,11 +39,12 @@ brew install qemu git
 
 | Command | What it does |
 |---|---|
-| `cargo xtask build` | Builds user programs, validates them, builds the kernel with their digests, fetches and verifies Limine, assembles `target/esp/` |
-| `cargo xtask run` | `build` + boots in QEMU with the serial console on your terminal |
+| `cargo xtask build` | Builds user programs, validates them, builds a normal kernel with their digests, fetches and verifies Limine, assembles `target/esp/` |
+| `cargo xtask run` | Like `build`, but a *test kernel* (feature `selftest`), booted in QEMU with the serial console on your terminal |
 | `cargo xtask check` | Static checks: no third-party packages, `unsafe` confinement, forbidden instructions, CI pinning, docs vs ABI |
-| `cargo xtask test` | Static checks, then a release build with the `qemu-exit` and `audit` features and every QEMU scenario: the suite on three machine sizes, randomisation, fail-closed CPUs, boot tampering (~2.5 min) |
-| `cargo xtask test --quick` | The suite on the default machine and one tamper test (~20 s) |
+| `cargo xtask test` | Static checks, then a normal kernel and a test kernel (features `qemu-exit`, `audit`, `selftest`) and every QEMU scenario: the suite on three machine sizes and in both local APIC modes, the normal kernel, randomisation, fail-closed CPUs, boot tampering (~2.5 min) |
+| `cargo xtask test --quick` | The suite on the default machine and one tamper test (~1 min) |
+| `cargo xtask dist` | The demo package of the release page: a test kernel plus run scripts for Windows, Linux and macOS, in `target/dist/` |
 | `cargo xtask build --debug` / `run --debug` | Same with a debug kernel |
 | `cargo test -p kalkan-core -p xtask` | Host tests of the policy core and the build tool |
 | `cargo test -p kalkan-core --release -- --ignored` | Stress tests (millions of model steps and mutations) |

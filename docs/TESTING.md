@@ -8,7 +8,7 @@ describes the layers, what each one proves, and how to extend them.
 cargo test -p kalkan-core -p xtask                    # host tests (seconds)
 cargo test -p kalkan-core --release -- --ignored      # stress tests (seconds in release)
 cargo xtask check                                     # static checks of the claims
-cargo xtask test --quick                              # suite + one tamper test in QEMU (~20 s)
+cargo xtask test --quick                              # suite + one tamper test in QEMU (~1 min)
 cargo xtask test                                      # every scenario (~2.5 min) — what CI runs
 ```
 
